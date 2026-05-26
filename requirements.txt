@@ -1,0 +1,10 @@
+# 各工具依賴聯集（tkinter 為 Python 內建，不列）
+# 子工具各自的 requirements.txt 仍可獨立使用
+
+# Serial Port Tool
+PySide6>=6.5
+pyserial>=3.5
+
+# FT232H Tester
+pyftdi>=0.55
+pyusb>=1.2

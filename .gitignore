@@ -1,0 +1,42 @@
+# Build outputs
+build/
+dist/
+out/
+*.o
+*.obj
+*.exe
+*.elf
+*.bin
+*.hex
+*.map
+*.spec.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
+~$*
+
+# Tool-specific scratch
+tools/ft232h/tools/_cache/
