@@ -40,3 +40,14 @@ Thumbs.db
 
 # Tool-specific scratch
 tools/ft232h/tools/_cache/
+
+# STM32CubeIDE build artifacts（per-firmware-project build/ 區）
+**/Debug/
+**/Release/
+**/BUILD/
+*.cyclo
+*.d
+*.su
+*.lst
+*.list
+launcher_error.log

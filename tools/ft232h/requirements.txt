@@ -1,4 +1,0 @@
-pyftdi>=0.55.4
-pyusb>=1.2.1
-libusb-package>=1.0.26.2
-pyinstaller>=6.0

@@ -77,6 +77,11 @@ def main() -> int:
     if here not in sys.path:
         sys.path.insert(0, here)
 
+    # 把 jack-toolkit 根目錄塞進 sys.path 才能 import common.*
+    repo_root = os.path.abspath(os.path.join(here, "..", ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     from src.ui.main_window import MainWindow
 
     app = MainWindow()

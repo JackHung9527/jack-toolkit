@@ -1,0 +1,8 @@
+{
+  "name": "serial",
+  "display_name": "串列埠工具",
+  "description": "COM port HEX/ASCII 雙模式收發、連續傳送、內建程式設計師計算機",
+  "entry": "main.py",
+  "framework": "tkinter",
+  "requirements": null
+}

@@ -1,10 +1,13 @@
-# 各工具依賴聯集（tkinter 為 Python 內建，不列）
-# 子工具各自的 requirements.txt 仍可獨立使用
+# jack-toolkit 全套依賴（tkinter 為 Python 內建不列）
+# 每支子工具皆為獨立程序、共用此 requirements。
 
 # Serial Port Tool
-PySide6>=6.5
 pyserial>=3.5
 
 # FT232H Tester
-pyftdi>=0.55
-pyusb>=1.2
+pyftdi>=0.55.4
+pyusb>=1.2.1
+libusb-package>=1.0.26.2
+
+# 打包工具（要產 .exe 時才需要，預設不裝）
+# pyinstaller>=6.0

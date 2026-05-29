@@ -1,34 +1,47 @@
-"""Serial Port Tool - Qt6 + Python GUI.
+"""串列埠工具（tkinter 版）。
 
-Layout 參考使用者提供的 "串口測試" 圖：左右分割、右側為控制區。
-
-需求：
+功能：
 - 掃描並列出系統所有 COM port（含完整描述 / 廠商）
-- HEX 傳送，輸入 "01 AB 99" 等大小寫與分隔混用格式
+- HEX 傳送，輸入 `01 AB 99` 等大小寫與分隔混用格式
 - ASCII 傳送，可選結尾 None / \\r / \\n / \\r\\n
 - 連續傳送模式（間隔可調）
 - 接收三分頁：ASCII / HEX / 對照（hex dump）
-- 程式設計師計算機（HEX/DEC/OCT/BIN，含位元運算）
+- HEX 與 ASCII 輸入框是 editable combobox，自動保留歷史命令
+- 「停止顯示」勾選暫停 UI 更新，計數仍背景累加
+- 「記錄行數」可調整接收區最大保留行數
+- 工具選單內建程式設計師計算機（HEX/DEC/OCT/BIN + 位元運算）
+- 快捷鍵：F5 重新掃描、Ctrl+K 開啟計算機
 
 執行：python main.py
 """
 
+from __future__ import annotations
+
+import codecs
+import queue
 import re
 import sys
+import threading
+import time
+import tkinter as tk
+from dataclasses import dataclass
+from pathlib import Path
+from tkinter import font as tkfont
+from tkinter import messagebox, ttk
 from typing import Optional
 
-try:
-    from PySide6.QtCore import Qt, QTimer, QThread, Signal
-    from PySide6.QtGui import QAction, QFont, QTextCursor
-    from PySide6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-        QLabel, QComboBox, QPushButton, QLineEdit, QPlainTextEdit, QSpinBox,
-        QTabWidget, QGroupBox, QCheckBox, QSplitter, QMessageBox, QDialog,
-        QStatusBar,
-    )
-except ImportError:
-    print("缺少 PySide6。請執行: pip install PySide6", file=sys.stderr)
-    sys.exit(1)
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from common.hex_utils import (
+    bytes_to_ascii_inline_segments,
+    bytes_to_hex,
+    parse_hex,
+)
+
+ESC_TAG = "esc"
+ESC_COLOR = "#1f8acc"  # 淺藍色標示「跳脫字元」例如 \r \n \xNN，跟資料中字面字元區分
 
 try:
     from serial import Serial, SerialException
@@ -38,57 +51,52 @@ except ImportError:
     sys.exit(1)
 
 
-def parse_hex_input(text: str) -> bytes:
-    cleaned = re.sub(r"[\s,\-_:]", "", text)
-    if not cleaned:
-        return b""
-    if not re.fullmatch(r"[0-9A-Fa-f]+", cleaned):
-        raise ValueError("含非 HEX 字元（合法字元 0-9 A-F a-f 與分隔）")
-    if len(cleaned) % 2 != 0:
-        raise ValueError("HEX 字元數須為偶數（每個 byte 兩個 hex 字元）")
-    return bytes.fromhex(cleaned)
+HISTORY_MAX = 30
+POLL_INTERVAL_MS = 20
+MAX_FRAME_BYTES = 65536  # 依分隔符模式下，buffer 超過此值強制 flush 防止無限累積
+# 三種模式涵蓋常見情境：
+#   依閒置時間 50ms（預設）— 對 USB jitter 容錯較好，適合大多數情境
+#   依閒置時間 1ms — 幾乎等同即時模式（USB scheduler 1ms 粒度，幾乎不會合併）
+#   依分隔符 — 對有固定 framing 的協定 100% 可靠
+#   即時 — 每個 OS read 就一個封包，0 ms 延遲，給需要看 raw read 邊界 / debug USB 的人
+FRAME_MODES = ("依閒置時間", "依分隔符", "即時")
+DEFAULT_FRAME_MODE = "依閒置時間"
+DEFAULT_IDLE_MS = 50
+MIN_IDLE_MS = 1
+MAX_IDLE_MS = 2000
+DEFAULT_TERMINATORS = ("\\r\\n", "\\n", "\\r", "\\x00")
+# 截 USB hwid 只保留 VID:PID 段，砍掉 SER= LOCATION= 等
+_VID_PID_RE = re.compile(r"USB\s+VID:PID=[0-9A-Fa-f]+:[0-9A-Fa-f]+", re.IGNORECASE)
+BAUD_RATES = [
+    "9600", "19200", "38400", "57600", "115200", "230400",
+    "460800", "921600", "1200", "2400", "4800", "14400",
+]
+DATA_BITS = ["5", "6", "7", "8"]
+PARITIES = [("None", "N"), ("Even", "E"), ("Odd", "O"), ("Mark", "M"), ("Space", "S")]
+STOP_BITS = [("1", 1), ("1.5", 1.5), ("2", 2)]
+ENDINGS = [("無", b""), ("\\r", b"\r"), ("\\n", b"\n"), ("\\r\\n", b"\r\n")]
 
 
-def bytes_to_hex(data: bytes) -> str:
-    return " ".join(f"{b:02X}" for b in data)
+@dataclass
+class PortInfo:
+    device: str
+    label: str
 
 
-def bytes_to_ascii(data: bytes) -> str:
-    out = []
-    for b in data:
-        if b == 0x0D:
-            out.append("\\r")
-        elif b == 0x0A:
-            out.append("\\n\n")
-        elif b == 0x09:
-            out.append("\\t")
-        elif 32 <= b < 127:
-            out.append(chr(b))
-        else:
-            out.append(f"\\x{b:02X}")
-    return "".join(out)
+class SerialReader(threading.Thread):
+    """背景執行緒：把 serial bytes 推進 queue，由 UI 端 root.after() 取走。"""
 
-
-def make_hex_dump_line(offset: int, chunk: bytes, bytes_per_line: int = 16) -> str:
-    hex_part = " ".join(f"{b:02X}" for b in chunk).ljust(bytes_per_line * 3 - 1)
-    ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-    return f"{offset:08X}  {hex_part}  |{ascii_part}|"
-
-
-class SerialReader(QThread):
-    data_received = Signal(bytes)
-    error_occurred = Signal(str)
-
-    def __init__(self, ser: Serial, parent=None):
-        super().__init__(parent)
+    def __init__(self, ser: Serial, out_queue: "queue.Queue[bytes]") -> None:
+        super().__init__(daemon=True)
         self.ser = ser
+        self.queue = out_queue
         self._running = True
+        self.error: Optional[str] = None
 
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
-        self.wait(800)
 
-    def run(self):
+    def run(self) -> None:
         while self._running:
             try:
                 if self.ser is None or not self.ser.is_open:
@@ -97,80 +105,48 @@ class SerialReader(QThread):
                 if n > 0:
                     data = self.ser.read(n)
                     if data:
-                        self.data_received.emit(bytes(data))
+                        self.queue.put(bytes(data))
                 else:
-                    self.msleep(10)
-            except (SerialException, OSError) as e:
+                    threading.Event().wait(0.01)
+            except (SerialException, OSError) as exc:
                 if self._running:
-                    self.error_occurred.emit(str(e))
+                    self.error = str(exc)
+                    self.queue.put(b"")
                 break
 
 
-class HexDumpView:
-    BPL = 16
+class TextLineLimiter:
+    """限制 Text widget 行數，超過時刪掉最舊的 batch 行。"""
 
-    def __init__(self, hex_edit: QPlainTextEdit, dump_edit: QPlainTextEdit):
-        self.hex_edit = hex_edit
-        self.dump_edit = dump_edit
-        self.pending = bytearray()
-        self.offset = 0
-        self.has_partial = False
+    def __init__(self, widget: tk.Text, max_lines: int) -> None:
+        self.widget = widget
+        self.max_lines = max_lines
 
-    def reset(self):
-        self.pending.clear()
-        self.offset = 0
-        self.has_partial = False
+    def set_max(self, max_lines: int) -> None:
+        self.max_lines = max_lines
 
-    def append(self, data: bytes):
-        self._clear_partial()
-        self.pending.extend(data)
-        while len(self.pending) >= self.BPL:
-            chunk = bytes(self.pending[:self.BPL])
-            del self.pending[:self.BPL]
-            self._write_full_line(chunk)
-            self.offset += self.BPL
-        if self.pending:
-            self._write_partial(bytes(self.pending))
-
-    def _write_full_line(self, chunk: bytes):
-        hex_line = bytes_to_hex(chunk)
-        dump_line = make_hex_dump_line(self.offset, chunk, self.BPL)
-        cur = self.hex_edit.textCursor()
-        cur.movePosition(QTextCursor.End)
-        cur.insertText(hex_line + "\n")
-        cur2 = self.dump_edit.textCursor()
-        cur2.movePosition(QTextCursor.End)
-        cur2.insertText(dump_line + "\n")
-
-    def _write_partial(self, chunk: bytes):
-        hex_line = bytes_to_hex(chunk)
-        dump_line = make_hex_dump_line(self.offset, chunk, self.BPL)
-        cur = self.hex_edit.textCursor()
-        cur.movePosition(QTextCursor.End)
-        cur.insertText(hex_line)
-        cur2 = self.dump_edit.textCursor()
-        cur2.movePosition(QTextCursor.End)
-        cur2.insertText(dump_line)
-        self.has_partial = True
-
-    def _clear_partial(self):
-        if not self.has_partial:
+    def trim(self) -> None:
+        try:
+            end_index = self.widget.index("end-1c")
+            line_count = int(end_index.split(".")[0])
+        except (tk.TclError, ValueError):
             return
-        for edit in (self.hex_edit, self.dump_edit):
-            cur = edit.textCursor()
-            cur.movePosition(QTextCursor.End)
-            cur.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
-            cur.removeSelectedText()
-        self.has_partial = False
+        if line_count > self.max_lines:
+            excess = line_count - self.max_lines
+            self.widget.delete("1.0", f"{excess + 1}.0")
 
 
-class ProgrammerCalculator(QDialog):
+class ProgrammerCalculator(tk.Toplevel):
+    """程式設計師計算機（HEX/DEC/OCT/BIN + 位元運算）。"""
+
     BIT_MASK = {8: 0xFF, 16: 0xFFFF, 32: 0xFFFFFFFF, 64: 0xFFFFFFFFFFFFFFFF}
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("程式設計師計算機")
-        self.resize(440, 540)
+    def __init__(self, master: tk.Misc) -> None:
+        super().__init__(master)
+        self.title("程式設計師計算機")
+        self.geometry("460x540")
+        self.minsize(420, 500)
+
         self.value = 0
         self.pending_op: Optional[str] = None
         self.pending_value = 0
@@ -178,6 +154,9 @@ class ProgrammerCalculator(QDialog):
         self.fresh_input = True
         self.base = 16
         self.bit_width = 32
+
+        self._display_vars: dict[str, tk.StringVar] = {}
+        self.digit_buttons: dict[str, ttk.Button] = {}
         self._build_ui()
         self._refresh()
 
@@ -185,37 +164,50 @@ class ProgrammerCalculator(QDialog):
     def mask(self) -> int:
         return self.BIT_MASK[self.bit_width]
 
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-        disp = QGroupBox("顯示")
-        gl = QGridLayout(disp)
-        font = QFont("Consolas", 11)
-        self.hex_d = QLineEdit("0"); self.hex_d.setFont(font); self.hex_d.setReadOnly(True)
-        self.dec_d = QLineEdit("0"); self.dec_d.setFont(font); self.dec_d.setReadOnly(True)
-        self.oct_d = QLineEdit("0"); self.oct_d.setFont(font); self.oct_d.setReadOnly(True)
-        self.bin_d = QLineEdit("0"); self.bin_d.setFont(font); self.bin_d.setReadOnly(True)
-        gl.addWidget(QLabel("HEX"), 0, 0); gl.addWidget(self.hex_d, 0, 1)
-        gl.addWidget(QLabel("DEC"), 1, 0); gl.addWidget(self.dec_d, 1, 1)
-        gl.addWidget(QLabel("OCT"), 2, 0); gl.addWidget(self.oct_d, 2, 1)
-        gl.addWidget(QLabel("BIN"), 3, 0); gl.addWidget(self.bin_d, 3, 1)
-        layout.addWidget(disp)
+    def _build_ui(self) -> None:
+        mono = tkfont.Font(family="Consolas", size=11)
 
-        mode = QHBoxLayout()
-        mode.addWidget(QLabel("輸入進位:"))
-        self.base_combo = QComboBox()
-        self.base_combo.addItems(["HEX", "DEC", "OCT", "BIN"])
-        self.base_combo.currentIndexChanged.connect(self._on_base_changed)
-        mode.addWidget(self.base_combo)
-        mode.addWidget(QLabel("位元寬度:"))
-        self.bw_combo = QComboBox()
-        self.bw_combo.addItems(["8", "16", "32", "64"])
-        self.bw_combo.setCurrentText("32")
-        self.bw_combo.currentTextChanged.connect(self._on_bw_changed)
-        mode.addWidget(self.bw_combo)
-        mode.addStretch()
-        layout.addLayout(mode)
+        outer = ttk.Frame(self, padding=8)
+        outer.pack(fill="both", expand=True)
 
-        grid = QGridLayout()
+        disp = ttk.LabelFrame(outer, text="顯示", padding=6)
+        disp.pack(fill="x")
+        for row, key in enumerate(("HEX", "DEC", "OCT", "BIN")):
+            ttk.Label(disp, text=key, width=4).grid(row=row, column=0, sticky="w", pady=2)
+            var = tk.StringVar(value="0")
+            self._display_vars[key] = var
+            entry = ttk.Entry(disp, textvariable=var, font=mono, state="readonly")
+            entry.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=2)
+        disp.columnconfigure(1, weight=1)
+
+        mode = ttk.Frame(outer)
+        mode.pack(fill="x", pady=(8, 4))
+        ttk.Label(mode, text="輸入進位:").pack(side="left")
+        self.base_var = tk.StringVar(value="HEX")
+        base_combo = ttk.Combobox(
+            mode,
+            textvariable=self.base_var,
+            values=["HEX", "DEC", "OCT", "BIN"],
+            state="readonly",
+            width=6,
+        )
+        base_combo.pack(side="left", padx=(4, 12))
+        base_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_base_changed())
+
+        ttk.Label(mode, text="位元寬度:").pack(side="left")
+        self.bw_var = tk.StringVar(value="32")
+        bw_combo = ttk.Combobox(
+            mode,
+            textvariable=self.bw_var,
+            values=["8", "16", "32", "64"],
+            state="readonly",
+            width=5,
+        )
+        bw_combo.pack(side="left", padx=(4, 0))
+        bw_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_bw_changed())
+
+        grid = ttk.Frame(outer)
+        grid.pack(fill="both", expand=True, pady=(8, 0))
         layout_btns = [
             [("AC", "fn"), ("CE", "fn"), ("Back", "fn"), ("+/-", "fn"), ("NOT", "fn")],
             [("AND", "op"), ("OR", "op"), ("XOR", "op"), ("<<", "op"), (">>", "op")],
@@ -223,57 +215,63 @@ class ProgrammerCalculator(QDialog):
             [("F", "d"), ("7", "d"), ("8", "d"), ("9", "d"), ("/", "op")],
             [("Mod", "op"), ("4", "d"), ("5", "d"), ("6", "d"), ("*", "op")],
             [("00", "d"), ("1", "d"), ("2", "d"), ("3", "d"), ("-", "op")],
-            [("FF", "d"), ("0", "d"), ("=", "fn"), ("",  "sp"), ("+", "op")],
+            [("FF", "d"), ("0", "d"), ("=", "fn"), ("", "sp"), ("+", "op")],
         ]
-        self.digit_buttons = {}
         for r, row in enumerate(layout_btns):
+            grid.rowconfigure(r, weight=1)
             for c, (label, kind) in enumerate(row):
+                grid.columnconfigure(c, weight=1)
                 if kind == "sp":
                     continue
-                btn = QPushButton(label)
-                btn.setMinimumHeight(36)
-                btn.clicked.connect(lambda _, x=label: self._on_button(x))
-                grid.addWidget(btn, r, c)
+                btn = ttk.Button(grid, text=label, command=lambda lab=label: self._on_button(lab))
+                btn.grid(row=r, column=c, sticky="nsew", padx=2, pady=2, ipady=4)
                 if kind == "d" and label in "0123456789ABCDEF":
                     self.digit_buttons[label] = btn
-        layout.addLayout(grid)
+
         self._sync_digit_enables()
 
-    def _sync_digit_enables(self):
+    def _sync_digit_enables(self) -> None:
         allowed = {
             16: set("0123456789ABCDEF"),
             10: set("0123456789"),
-            8:  set("01234567"),
-            2:  set("01"),
+            8: set("01234567"),
+            2: set("01"),
         }[self.base]
         for k, btn in self.digit_buttons.items():
-            btn.setEnabled(k in allowed)
+            state = ("!disabled",) if k in allowed else ("disabled",)
+            btn.state(state)
 
-    def _on_base_changed(self, idx):
-        self.base = [16, 10, 8, 2][idx]
+    def _on_base_changed(self) -> None:
+        self.base = {"HEX": 16, "DEC": 10, "OCT": 8, "BIN": 2}[self.base_var.get()]
         self.input_buffer = self._fmt(self.value, self.base)
         self.fresh_input = True
         self._sync_digit_enables()
         self._refresh()
 
-    def _on_bw_changed(self, txt):
-        self.bit_width = int(txt)
+    def _on_bw_changed(self) -> None:
+        self.bit_width = int(self.bw_var.get())
         self.value &= self.mask
         self.pending_value &= self.mask
         self._refresh()
 
-    def _on_button(self, label: str):
+    def _on_button(self, label: str) -> None:
         if label in "0123456789ABCDEF":
             self._append_digit(label)
         elif label == "00":
-            self._append_digit("0"); self._append_digit("0")
+            self._append_digit("0")
+            self._append_digit("0")
         elif label == "FF":
-            self._append_digit("F"); self._append_digit("F")
+            self._append_digit("F")
+            self._append_digit("F")
         elif label == "AC":
-            self.value = 0; self.pending_op = None; self.pending_value = 0
-            self.input_buffer = "0"; self.fresh_input = True
+            self.value = 0
+            self.pending_op = None
+            self.pending_value = 0
+            self.input_buffer = "0"
+            self.fresh_input = True
         elif label == "CE":
-            self.input_buffer = "0"; self.fresh_input = True
+            self.input_buffer = "0"
+            self.fresh_input = True
             self.value = 0
         elif label == "Back":
             if not self.fresh_input and len(self.input_buffer) > 1:
@@ -283,7 +281,9 @@ class ProgrammerCalculator(QDialog):
                 except ValueError:
                     self.value = 0
             else:
-                self.input_buffer = "0"; self.fresh_input = True; self.value = 0
+                self.input_buffer = "0"
+                self.fresh_input = True
+                self.value = 0
         elif label == "+/-":
             self.value = ((~self.value) + 1) & self.mask
             self.input_buffer = self._fmt(self.value, self.base)
@@ -302,7 +302,7 @@ class ProgrammerCalculator(QDialog):
             self.pending_op = None
         self._refresh()
 
-    def _append_digit(self, d: str):
+    def _append_digit(self, d: str) -> None:
         if self.fresh_input:
             self.input_buffer = d
             self.fresh_input = False
@@ -315,25 +315,36 @@ class ProgrammerCalculator(QDialog):
         except ValueError:
             pass
 
-    def _commit_pending(self):
+    def _commit_pending(self) -> None:
         if self.pending_op is None:
             return
         a = self.pending_value & self.mask
         b = self.value & self.mask
         op = self.pending_op
         try:
-            if   op == "+":   r = (a + b) & self.mask
-            elif op == "-":   r = (a - b) & self.mask
-            elif op == "*":   r = (a * b) & self.mask
-            elif op == "/":   r = (a // b) if b else 0
-            elif op == "Mod": r = (a % b) if b else 0
-            elif op == "AND": r = a & b
-            elif op == "OR":  r = a | b
-            elif op == "XOR": r = a ^ b
-            elif op == "<<":  r = (a << (b & (self.bit_width - 1))) & self.mask
-            elif op == ">>":  r = (a & self.mask) >> (b & (self.bit_width - 1))
-            else:             r = b
-        except Exception:
+            if op == "+":
+                r = (a + b) & self.mask
+            elif op == "-":
+                r = (a - b) & self.mask
+            elif op == "*":
+                r = (a * b) & self.mask
+            elif op == "/":
+                r = (a // b) if b else 0
+            elif op == "Mod":
+                r = (a % b) if b else 0
+            elif op == "AND":
+                r = a & b
+            elif op == "OR":
+                r = a | b
+            elif op == "XOR":
+                r = a ^ b
+            elif op == "<<":
+                r = (a << (b & (self.bit_width - 1))) & self.mask
+            elif op == ">>":
+                r = (a & self.mask) >> (b & (self.bit_width - 1))
+            else:
+                r = b
+        except (OverflowError, ValueError):
             r = 0
         self.value = r & self.mask
         self.input_buffer = self._fmt(self.value, self.base)
@@ -341,455 +352,686 @@ class ProgrammerCalculator(QDialog):
 
     @staticmethod
     def _fmt(v: int, base: int) -> str:
-        if base == 16: return f"{v:X}"
-        if base == 10: return str(v)
-        if base == 8:  return f"{v:o}"
-        if base == 2:  return f"{v:b}"
+        if base == 16:
+            return f"{v:X}"
+        if base == 10:
+            return str(v)
+        if base == 8:
+            return f"{v:o}"
+        if base == 2:
+            return f"{v:b}"
         return str(v)
 
-    def _refresh(self):
+    def _refresh(self) -> None:
         v = self.value & self.mask
         bw = self.bit_width
-        self.hex_d.setText(f"{v:0{bw // 4}X}")
-        self.dec_d.setText(str(v))
-        self.oct_d.setText(f"{v:o}")
+        self._display_vars["HEX"].set(f"{v:0{bw // 4}X}")
+        self._display_vars["DEC"].set(str(v))
+        self._display_vars["OCT"].set(f"{v:o}")
         bin_str = f"{v:0{bw}b}"
-        self.bin_d.setText(" ".join(bin_str[i:i+4] for i in range(0, len(bin_str), 4)))
+        self._display_vars["BIN"].set(" ".join(bin_str[i:i + 4] for i in range(0, len(bin_str), 4)))
 
 
-class MainWindow(QMainWindow):
-    BAUD_RATES = [
-        "9600", "19200", "38400", "57600", "115200", "230400",
-        "460800", "921600", "1200", "2400", "4800", "14400",
-    ]
-    DATA_BITS = ["5", "6", "7", "8"]
-    PARITIES = [("None", "N"), ("Even", "E"), ("Odd", "O"), ("Mark", "M"), ("Space", "S")]
-    STOP_BITS = [("1", 1), ("1.5", 1.5), ("2", 2)]
-    HISTORY_MAX = 30
+class SerialApp:
+    """主視窗 controller。"""
 
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Serial Port Tool - Qt6")
-        self.resize(1200, 760)
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
         self.ser: Optional[Serial] = None
         self.reader: Optional[SerialReader] = None
+        self.rx_queue: "queue.Queue[bytes]" = queue.Queue()
         self.calc_dialog: Optional[ProgrammerCalculator] = None
-        self._repeat_kind: Optional[str] = None
         self.rx_total = 0
         self.tx_total = 0
-        self._build_ui()
+        self.rx_packet_idx = 0
+        self._rx_buffer = bytearray()
+        self._rx_last_byte_time = 0.0
+        self._ports: list[PortInfo] = []
+        self._hex_history: list[str] = []
+        self._ascii_history: list[str] = []
+        self._repeat_kind: Optional[str] = None
+        self._repeat_after_id: Optional[str] = None
+
+        root.title("串列埠工具")
+        root.geometry("1200x760")
+        root.minsize(960, 600)
+
+        try:
+            ttk.Style().theme_use("vista")
+        except tk.TclError:
+            pass
+
         self._build_menu()
-        self.dump_view = HexDumpView(self.rx_hex, self.rx_both)
-        self.tx_timer = QTimer(self)
-        self.tx_timer.timeout.connect(self._on_repeat_tick)
+        self._build_ui()
         self._refresh_ports()
         self._set_connected(False)
+        self._poll_queue()
 
-    def _build_menu(self):
-        menubar = self.menuBar()
-        file_menu = menubar.addMenu("檔案(&F)")
-        act_quit = QAction("結束", self)
-        act_quit.triggered.connect(self.close)
-        file_menu.addAction(act_quit)
-        tools_menu = menubar.addMenu("工具(&T)")
-        act_calc = QAction("程式設計師計算機", self)
-        act_calc.setShortcut("Ctrl+K")
-        act_calc.triggered.connect(self._open_calculator)
-        tools_menu.addAction(act_calc)
-        act_rescan = QAction("重新掃描通訊埠", self)
-        act_rescan.setShortcut("F5")
-        act_rescan.triggered.connect(self._refresh_ports)
-        tools_menu.addAction(act_rescan)
-        help_menu = menubar.addMenu("說明(&H)")
-        act_about = QAction("關於", self)
-        act_about.triggered.connect(self._show_about)
-        help_menu.addAction(act_about)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _open_calculator(self):
-        if self.calc_dialog is None:
-            self.calc_dialog = ProgrammerCalculator(self)
-        self.calc_dialog.show()
-        self.calc_dialog.raise_()
-        self.calc_dialog.activateWindow()
+    def _build_menu(self) -> None:
+        menubar = tk.Menu(self.root)
+        file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="結束", command=self._on_close)
+        menubar.add_cascade(label="檔案(F)", menu=file_menu, underline=3)
 
-    def _show_about(self):
-        QMessageBox.information(
-            self, "關於",
-            "Serial Port Tool\nQt6 (PySide6) + pyserial\n"
-            "支援 ASCII / HEX 雙模式收發、連續傳送、程式設計師計算機。",
+        tools_menu = tk.Menu(menubar, tearoff=False)
+        tools_menu.add_command(label="程式設計師計算機  Ctrl+K", command=self._open_calculator)
+        tools_menu.add_command(label="重新掃描通訊埠  F5", command=self._refresh_ports)
+        menubar.add_cascade(label="工具(T)", menu=tools_menu, underline=3)
+
+        help_menu = tk.Menu(menubar, tearoff=False)
+        help_menu.add_command(label="關於", command=self._show_about)
+        menubar.add_cascade(label="說明(H)", menu=help_menu, underline=3)
+
+        self.root.config(menu=menubar)
+        self.root.bind_all("<F5>", lambda _e: self._refresh_ports())
+        self.root.bind_all("<Control-k>", lambda _e: self._open_calculator())
+        self.root.bind_all("<Control-K>", lambda _e: self._open_calculator())
+
+    def _build_ui(self) -> None:
+        mono = tkfont.Font(family="Consolas", size=10)
+
+        paned = ttk.PanedWindow(self.root, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=6, pady=6)
+
+        left = ttk.Frame(paned)
+        paned.add(left, weight=3)
+        right = ttk.Frame(paned, width=400)
+        paned.add(right, weight=1)
+
+        rx_ctrl = ttk.Frame(left)
+        rx_ctrl.pack(fill="x")
+        ttk.Button(rx_ctrl, text="清空接收", command=self._clear_rx).pack(side="left")
+
+        self.freeze_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(rx_ctrl, text="停止顯示", variable=self.freeze_var).pack(side="left", padx=(8, 0))
+        self.autoscroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rx_ctrl, text="自動捲動", variable=self.autoscroll_var).pack(side="left", padx=(8, 0))
+
+        ttk.Label(rx_ctrl, text="記錄行數:").pack(side="right", padx=(0, 4))
+        self.max_lines_var = tk.IntVar(value=5000)
+        max_spin = ttk.Spinbox(
+            rx_ctrl,
+            from_=100,
+            to=100000,
+            increment=500,
+            textvariable=self.max_lines_var,
+            width=8,
+            command=self._on_max_lines_changed,
+        )
+        max_spin.pack(side="right")
+
+        # 封包邊界控制：決定 RX buffer 怎麼切成一個個顯示用的封包
+        frame_ctrl = ttk.Frame(left)
+        frame_ctrl.pack(fill="x", pady=(2, 0))
+        ttk.Label(frame_ctrl, text="封包邊界:").pack(side="left")
+        self.frame_mode_var = tk.StringVar(value=DEFAULT_FRAME_MODE)
+        mode_combo = ttk.Combobox(
+            frame_ctrl,
+            textvariable=self.frame_mode_var,
+            values=list(FRAME_MODES),
+            state="readonly",
+            width=12,
+        )
+        mode_combo.pack(side="left", padx=(4, 12))
+        mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_frame_mode_changed())
+
+        self.frame_term_label = ttk.Label(frame_ctrl, text="分隔符:")
+        self.frame_term_var = tk.StringVar(value="\\r\\n")
+        self.frame_term_combo = ttk.Combobox(
+            frame_ctrl,
+            textvariable=self.frame_term_var,
+            values=list(DEFAULT_TERMINATORS),
+            width=10,
         )
 
-    def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(6, 6, 6, 6)
-        splitter = QSplitter(Qt.Horizontal)
-        main_layout.addWidget(splitter)
+        self.frame_idle_label = ttk.Label(frame_ctrl, text="閒置 (ms):")
+        self.frame_idle_var = tk.IntVar(value=DEFAULT_IDLE_MS)
+        self.frame_idle_spin = ttk.Spinbox(
+            frame_ctrl,
+            from_=MIN_IDLE_MS,
+            to=MAX_IDLE_MS,
+            increment=1,
+            textvariable=self.frame_idle_var,
+            width=6,
+        )
 
-        left = QWidget()
-        ll = QVBoxLayout(left)
-        ll.setContentsMargins(2, 2, 2, 2)
-        rx_ctrl = QHBoxLayout()
-        btn_clear_rx_l = QPushButton("清空接收")
-        btn_clear_rx_l.clicked.connect(self._clear_rx)
-        rx_ctrl.addWidget(btn_clear_rx_l)
-        self.chk_freeze = QCheckBox("停止顯示")
-        self.chk_freeze.setToolTip("勾選後接收區暫停更新（資料仍在背景累積計數）")
-        rx_ctrl.addWidget(self.chk_freeze)
-        self.chk_autoscroll = QCheckBox("自動捲動")
-        self.chk_autoscroll.setChecked(True)
-        rx_ctrl.addWidget(self.chk_autoscroll)
-        rx_ctrl.addStretch()
-        rx_ctrl.addWidget(QLabel("記錄行數:"))
-        self.spin_max_lines = QSpinBox()
-        self.spin_max_lines.setRange(100, 100000)
-        self.spin_max_lines.setValue(5000)
-        self.spin_max_lines.setSingleStep(500)
-        self.spin_max_lines.valueChanged.connect(self._on_max_lines_changed)
-        rx_ctrl.addWidget(self.spin_max_lines)
-        ll.addLayout(rx_ctrl)
+        notebook = ttk.Notebook(left)
+        notebook.pack(fill="both", expand=True, pady=(4, 4))
 
-        self.tab_rx = QTabWidget()
-        mono = QFont("Consolas", 10)
-        self.rx_ascii = QPlainTextEdit(); self.rx_ascii.setReadOnly(True); self.rx_ascii.setFont(mono)
-        self.rx_hex   = QPlainTextEdit(); self.rx_hex.setReadOnly(True);   self.rx_hex.setFont(mono)
-        self.rx_both  = QPlainTextEdit(); self.rx_both.setReadOnly(True);  self.rx_both.setFont(mono)
-        for w in (self.rx_ascii, self.rx_hex, self.rx_both):
-            w.setMaximumBlockCount(self.spin_max_lines.value())
-        self.tab_rx.addTab(self.rx_ascii, "ASCII")
-        self.tab_rx.addTab(self.rx_hex, "HEX")
-        self.tab_rx.addTab(self.rx_both, "對照")
-        ll.addWidget(self.tab_rx, stretch=1)
+        self.rx_ascii = self._make_text_tab(notebook, "ASCII", mono)
+        self.rx_hex = self._make_text_tab(notebook, "HEX", mono)
+        self.rx_both = self._make_text_tab(notebook, "對照", mono)
 
-        cnt_row = QHBoxLayout()
-        self.lbl_rx_count = QLabel("接收: 0 bytes")
-        self.lbl_tx_count = QLabel("發送: 0 bytes")
-        cnt_row.addWidget(self.lbl_rx_count)
-        cnt_row.addSpacing(20)
-        cnt_row.addWidget(self.lbl_tx_count)
-        cnt_row.addStretch()
-        ll.addLayout(cnt_row)
-        splitter.addWidget(left)
+        self.ascii_limiter = TextLineLimiter(self.rx_ascii, self.max_lines_var.get())
+        self.hex_limiter = TextLineLimiter(self.rx_hex, self.max_lines_var.get())
+        self.both_limiter = TextLineLimiter(self.rx_both, self.max_lines_var.get())
 
-        right = QWidget()
-        right.setMinimumWidth(380)
-        right.setMaximumWidth(440)
-        rl = QVBoxLayout(right)
-        rl.setContentsMargins(2, 2, 2, 2)
+        # 替 ASCII 與 對照 兩個 widget 設「跳脫字元淺藍色」tag
+        for w in (self.rx_ascii, self.rx_both):
+            w.tag_configure(ESC_TAG, foreground=ESC_COLOR)
 
-        hex_box = QGroupBox("HEX")
-        hexl = QVBoxLayout(hex_box)
-        self.hex_input = QComboBox()
-        self.hex_input.setEditable(True)
-        self.hex_input.setFont(mono)
-        self.hex_input.setInsertPolicy(QComboBox.NoInsert)
-        self.hex_input.lineEdit().setPlaceholderText("AA 55 1A 00 00 19  （大小寫均可）")
-        self.hex_input.lineEdit().returnPressed.connect(lambda: self._send_once("hex"))
-        hexl.addWidget(self.hex_input)
-        hex_btn_row = QHBoxLayout()
-        hex_btn_row.addStretch()
-        self.btn_repeat_hex = QPushButton("連續傳送")
-        self.btn_repeat_hex.setCheckable(True)
-        self.btn_repeat_hex.toggled.connect(lambda on: self._toggle_repeat("hex", on))
-        hex_btn_row.addWidget(self.btn_repeat_hex)
-        self.btn_send_hex = QPushButton("單筆傳送")
-        self.btn_send_hex.clicked.connect(lambda: self._send_once("hex"))
-        hex_btn_row.addWidget(self.btn_send_hex)
-        hexl.addLayout(hex_btn_row)
-        rl.addWidget(hex_box)
+        cnt_row = ttk.Frame(left)
+        cnt_row.pack(fill="x")
+        self.rx_count_var = tk.StringVar(value="接收: 0 bytes")
+        self.tx_count_var = tk.StringVar(value="發送: 0 bytes")
+        ttk.Label(cnt_row, textvariable=self.rx_count_var).pack(side="left")
+        ttk.Label(cnt_row, textvariable=self.tx_count_var).pack(side="left", padx=(20, 0))
 
-        ascii_box = QGroupBox("ASCII")
-        asciil = QVBoxLayout(ascii_box)
-        self.ascii_input = QComboBox()
-        self.ascii_input.setEditable(True)
-        self.ascii_input.setFont(mono)
-        self.ascii_input.setInsertPolicy(QComboBox.NoInsert)
-        self.ascii_input.lineEdit().setPlaceholderText("輸入要傳送的 ASCII 字串")
-        self.ascii_input.lineEdit().returnPressed.connect(lambda: self._send_once("ascii"))
-        asciil.addWidget(self.ascii_input)
-        end_row = QHBoxLayout()
-        end_row.addWidget(QLabel("結尾:"))
-        self.end_combo = QComboBox()
-        self.end_combo.addItem("無", b"")
-        self.end_combo.addItem("\\r", b"\r")
-        self.end_combo.addItem("\\n", b"\n")
-        self.end_combo.addItem("\\r\\n", b"\r\n")
-        self.end_combo.setCurrentIndex(3)
-        self.end_combo.setMinimumWidth(70)
-        end_row.addWidget(self.end_combo)
-        end_row.addStretch()
-        self.btn_repeat_ascii = QPushButton("連續傳送")
-        self.btn_repeat_ascii.setCheckable(True)
-        self.btn_repeat_ascii.toggled.connect(lambda on: self._toggle_repeat("ascii", on))
-        end_row.addWidget(self.btn_repeat_ascii)
-        self.btn_send_ascii = QPushButton("單筆傳送")
-        self.btn_send_ascii.clicked.connect(lambda: self._send_once("ascii"))
-        end_row.addWidget(self.btn_send_ascii)
-        asciil.addLayout(end_row)
-        rl.addWidget(ascii_box)
+        hex_box = ttk.LabelFrame(right, text="HEX", padding=6)
+        hex_box.pack(fill="x", pady=(0, 6))
+        self.hex_input_var = tk.StringVar()
+        self.hex_input = ttk.Combobox(
+            hex_box,
+            textvariable=self.hex_input_var,
+            font=mono,
+            values=[],
+        )
+        self.hex_input.pack(fill="x")
+        self.hex_input.bind("<Return>", lambda _e: self._send_once("hex"))
+        hex_btn_row = ttk.Frame(hex_box)
+        hex_btn_row.pack(fill="x", pady=(4, 0))
+        self.btn_repeat_hex = ttk.Button(
+            hex_btn_row,
+            text="連續傳送",
+            command=lambda: self._toggle_repeat("hex"),
+        )
+        self.btn_repeat_hex.pack(side="right", padx=(4, 0))
+        self.btn_send_hex = ttk.Button(hex_btn_row, text="單筆傳送", command=lambda: self._send_once("hex"))
+        self.btn_send_hex.pack(side="right")
 
-        intv_row = QHBoxLayout()
-        intv_row.addWidget(QLabel("連續傳送間隔 (ms):"))
-        self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(10, 60000)
-        self.interval_spin.setValue(1000)
-        self.interval_spin.setSingleStep(100)
-        self.interval_spin.valueChanged.connect(self._on_interval_changed)
-        intv_row.addWidget(self.interval_spin)
-        intv_row.addStretch()
-        rl.addLayout(intv_row)
+        ascii_box = ttk.LabelFrame(right, text="ASCII", padding=6)
+        ascii_box.pack(fill="x", pady=(0, 6))
+        self.ascii_input_var = tk.StringVar()
+        self.ascii_input = ttk.Combobox(
+            ascii_box,
+            textvariable=self.ascii_input_var,
+            font=mono,
+            values=[],
+        )
+        self.ascii_input.pack(fill="x")
+        self.ascii_input.bind("<Return>", lambda _e: self._send_once("ascii"))
+        end_row = ttk.Frame(ascii_box)
+        end_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(end_row, text="結尾:").pack(side="left")
+        self.end_var = tk.StringVar(value=ENDINGS[3][0])
+        end_combo = ttk.Combobox(
+            end_row,
+            textvariable=self.end_var,
+            values=[name for name, _ in ENDINGS],
+            state="readonly",
+            width=8,
+        )
+        end_combo.pack(side="left", padx=(4, 0))
+        self.btn_repeat_ascii = ttk.Button(
+            end_row,
+            text="連續傳送",
+            command=lambda: self._toggle_repeat("ascii"),
+        )
+        self.btn_repeat_ascii.pack(side="right", padx=(4, 0))
+        self.btn_send_ascii = ttk.Button(end_row, text="單筆傳送", command=lambda: self._send_once("ascii"))
+        self.btn_send_ascii.pack(side="right")
 
-        cfg_box = QGroupBox("傳輸設定")
-        cfgl = QGridLayout(cfg_box)
-        cfgl.addWidget(QLabel("通訊埠:"), 0, 0)
-        self.port_combo = QComboBox()
-        cfgl.addWidget(self.port_combo, 0, 1, 1, 2)
-        btn_rescan = QPushButton("重新掃描")
-        btn_rescan.clicked.connect(self._refresh_ports)
-        cfgl.addWidget(btn_rescan, 0, 3)
-        cfgl.addWidget(QLabel("傳輸速率:"), 1, 0)
-        self.baud_combo = QComboBox()
-        self.baud_combo.addItems(self.BAUD_RATES)
-        self.baud_combo.setCurrentText("115200")
-        self.baud_combo.setEditable(True)
-        cfgl.addWidget(self.baud_combo, 1, 1, 1, 3)
-        cfgl.addWidget(QLabel("資料位元:"), 2, 0)
-        self.data_combo = QComboBox()
-        self.data_combo.addItems(self.DATA_BITS)
-        self.data_combo.setCurrentText("8")
-        cfgl.addWidget(self.data_combo, 2, 1, 1, 3)
-        cfgl.addWidget(QLabel("檢查位元:"), 3, 0)
-        self.parity_combo = QComboBox()
-        for n, _ in self.PARITIES:
-            self.parity_combo.addItem(n)
-        cfgl.addWidget(self.parity_combo, 3, 1, 1, 3)
-        cfgl.addWidget(QLabel("停止位元:"), 4, 0)
-        self.stop_combo = QComboBox()
-        for n, _ in self.STOP_BITS:
-            self.stop_combo.addItem(n)
-        cfgl.addWidget(self.stop_combo, 4, 1, 1, 3)
-        rl.addWidget(cfg_box)
+        intv_row = ttk.Frame(right)
+        intv_row.pack(fill="x", pady=(0, 6))
+        ttk.Label(intv_row, text="連續傳送間隔 (ms):").pack(side="left")
+        self.interval_var = tk.IntVar(value=1000)
+        ttk.Spinbox(
+            intv_row,
+            from_=10,
+            to=60000,
+            increment=100,
+            textvariable=self.interval_var,
+            width=8,
+        ).pack(side="left", padx=(4, 0))
 
-        self.btn_clear_rec = QPushButton("清除記錄")
-        self.btn_clear_rec.clicked.connect(self._clear_rx)
-        rl.addWidget(self.btn_clear_rec)
-        self.btn_open = QPushButton("開啟通訊埠")
-        self.btn_open.clicked.connect(self._open_port)
-        rl.addWidget(self.btn_open)
-        self.btn_close = QPushButton("關閉通訊埠")
-        self.btn_close.clicked.connect(self._close_port)
-        rl.addWidget(self.btn_close)
-        rl.addStretch()
+        cfg_box = ttk.LabelFrame(right, text="傳輸設定", padding=6)
+        cfg_box.pack(fill="x", pady=(0, 6))
+        cfg_box.columnconfigure(1, weight=1)
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([820, 380])
+        ttk.Label(cfg_box, text="通訊埠:").grid(row=0, column=0, sticky="w", pady=2)
+        self.port_var = tk.StringVar()
+        self.port_combo = ttk.Combobox(cfg_box, textvariable=self.port_var, state="readonly", width=40)
+        self.port_combo.grid(row=0, column=1, sticky="ew", padx=(4, 4), pady=2)
+        ttk.Button(cfg_box, text="重新掃描", command=self._refresh_ports, width=10).grid(row=0, column=2, pady=2)
 
-        self.setStatusBar(QStatusBar(self))
-        self.statusBar().showMessage("未連線")
+        ttk.Label(cfg_box, text="傳輸速率:").grid(row=1, column=0, sticky="w", pady=2)
+        self.baud_var = tk.StringVar(value="115200")
+        self.baud_combo = ttk.Combobox(cfg_box, textvariable=self.baud_var, values=BAUD_RATES)
+        self.baud_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=2)
 
-    def _refresh_ports(self):
-        prev = self.port_combo.currentData()
-        self.port_combo.clear()
+        ttk.Label(cfg_box, text="資料位元:").grid(row=2, column=0, sticky="w", pady=2)
+        self.data_var = tk.StringVar(value="8")
+        self.data_combo = ttk.Combobox(cfg_box, textvariable=self.data_var, values=DATA_BITS, state="readonly")
+        self.data_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=2)
+
+        ttk.Label(cfg_box, text="檢查位元:").grid(row=3, column=0, sticky="w", pady=2)
+        self.parity_var = tk.StringVar(value=PARITIES[0][0])
+        self.parity_combo = ttk.Combobox(
+            cfg_box,
+            textvariable=self.parity_var,
+            values=[n for n, _ in PARITIES],
+            state="readonly",
+        )
+        self.parity_combo.grid(row=3, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=2)
+
+        ttk.Label(cfg_box, text="停止位元:").grid(row=4, column=0, sticky="w", pady=2)
+        self.stop_var = tk.StringVar(value=STOP_BITS[0][0])
+        self.stop_combo = ttk.Combobox(
+            cfg_box,
+            textvariable=self.stop_var,
+            values=[n for n, _ in STOP_BITS],
+            state="readonly",
+        )
+        self.stop_combo.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(4, 0), pady=2)
+
+        ttk.Button(right, text="清除記錄", command=self._clear_rx).pack(fill="x", pady=(0, 4))
+        self.btn_open = ttk.Button(right, text="開啟通訊埠", command=self._open_port)
+        self.btn_open.pack(fill="x", pady=(0, 4))
+        self.btn_close = ttk.Button(right, text="關閉通訊埠", command=self._close_port)
+        self.btn_close.pack(fill="x")
+
+        self.status_var = tk.StringVar(value="未連線")
+        ttk.Label(self.root, textvariable=self.status_var, anchor="w", relief="sunken").pack(side="bottom", fill="x")
+
+        self._on_frame_mode_changed()  # 初始時根據 mode 顯示對應的參數 widget
+
+    def _on_frame_mode_changed(self) -> None:
+        mode = self.frame_mode_var.get()
+        # 先全部 forget，再依 mode 把該顯示的 pack 回來
+        for w in (self.frame_term_label, self.frame_term_combo,
+                  self.frame_idle_label, self.frame_idle_spin):
+            w.pack_forget()
+        if mode == "依分隔符":
+            self.frame_term_label.pack(side="left", padx=(0, 4))
+            self.frame_term_combo.pack(side="left")
+        elif mode == "依閒置時間":
+            self.frame_idle_label.pack(side="left", padx=(0, 4))
+            self.frame_idle_spin.pack(side="left")
+        # 切 mode 時把舊 buffer 強制 flush 當一個 frame，避免殘留
+        if self._rx_buffer:
+            self._render_packet(bytes(self._rx_buffer))
+            self._rx_buffer.clear()
+
+    def _make_text_tab(self, notebook: ttk.Notebook, title: str, font: tkfont.Font) -> tk.Text:
+        frame = ttk.Frame(notebook)
+        notebook.add(frame, text=title)
+        text = tk.Text(frame, wrap="none", font=font, height=10, state="normal")
+        text.configure(undo=False)
+        ysb = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        xsb = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
+        text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        return text
+
+    def _show_about(self) -> None:
+        messagebox.showinfo(
+            "關於",
+            "串列埠工具\ntkinter + pyserial\n支援 ASCII / HEX 雙模式收發、連續傳送、程式設計師計算機。",
+        )
+
+    def _open_calculator(self) -> None:
+        if self.calc_dialog is None or not self.calc_dialog.winfo_exists():
+            self.calc_dialog = ProgrammerCalculator(self.root)
+        self.calc_dialog.deiconify()
+        self.calc_dialog.lift()
+        self.calc_dialog.focus_force()
+
+    def _refresh_ports(self) -> None:
+        prev = self._selected_device()
         ports = list(list_ports.comports())
+        self._ports = []
+        labels: list[str] = []
         if not ports:
-            self.port_combo.addItem("（找不到任何 COM port）", None)
-            return
-        for p in ports:
-            parts = [p.device]
-            if p.description and p.description != "n/a":
-                parts.append(p.description)
-            tail = []
-            if p.manufacturer and p.manufacturer != "n/a" and (
-                not p.description or p.manufacturer not in p.description
-            ):
-                tail.append(f"[{p.manufacturer}]")
-            if p.hwid and p.hwid != "n/a":
-                tail.append(f"{{{p.hwid}}}")
-            label = " - ".join(parts[:2])
-            if tail:
-                label += "  " + "  ".join(tail)
-            self.port_combo.addItem(label, p.device)
-            self.port_combo.setItemData(self.port_combo.count() - 1, label, Qt.ToolTipRole)
-        if prev:
-            for i in range(self.port_combo.count()):
-                if self.port_combo.itemData(i) == prev:
-                    self.port_combo.setCurrentIndex(i)
+            self._ports.append(PortInfo("", "（找不到任何 COM port）"))
+            labels.append(self._ports[0].label)
+        else:
+            for p in ports:
+                parts = [p.device]
+                if p.description and p.description != "n/a":
+                    parts.append(p.description)
+                tail = []
+                if p.manufacturer and p.manufacturer != "n/a" and (
+                    not p.description or p.manufacturer not in p.description
+                ):
+                    tail.append(f"[{p.manufacturer}]")
+                if p.hwid and p.hwid != "n/a":
+                    m = _VID_PID_RE.search(p.hwid)
+                    short = m.group(0) if m else p.hwid
+                    tail.append(f"{{{short}}}")
+                label = " - ".join(parts[:2])
+                if tail:
+                    label += "  " + "  ".join(tail)
+                self._ports.append(PortInfo(p.device, label))
+                labels.append(label)
+        self.port_combo["values"] = labels
+        if prev and any(pi.device == prev for pi in self._ports):
+            for pi in self._ports:
+                if pi.device == prev:
+                    self.port_var.set(pi.label)
                     break
+        else:
+            self.port_var.set(labels[0])
 
-    def _open_port(self):
+    def _selected_device(self) -> Optional[str]:
+        label = self.port_var.get()
+        for pi in self._ports:
+            if pi.label == label:
+                return pi.device or None
+        return None
+
+    def _ending_bytes(self) -> bytes:
+        name = self.end_var.get()
+        for n, b in ENDINGS:
+            if n == name:
+                return b
+        return b""
+
+    def _parity_code(self) -> str:
+        name = self.parity_var.get()
+        for n, code in PARITIES:
+            if n == name:
+                return code
+        return "N"
+
+    def _stop_value(self) -> float:
+        name = self.stop_var.get()
+        for n, v in STOP_BITS:
+            if n == name:
+                return v
+        return 1
+
+    def _push_history(self, kind: str, text: str) -> None:
+        if not text:
+            return
+        history = self._hex_history if kind == "hex" else self._ascii_history
+        combo = self.hex_input if kind == "hex" else self.ascii_input
+        if text in history:
+            history.remove(text)
+        history.insert(0, text)
+        del history[HISTORY_MAX:]
+        combo["values"] = history
+
+    def _open_port(self) -> None:
         if self.ser is not None and self.ser.is_open:
             return
-        device = self.port_combo.currentData()
+        device = self._selected_device()
         if not device:
-            QMessageBox.warning(self, "錯誤", "請選擇 COM port")
+            messagebox.showwarning("錯誤", "請選擇 COM port")
             return
         try:
-            baud = int(self.baud_combo.currentText())
+            baud = int(self.baud_var.get())
         except ValueError:
-            QMessageBox.warning(self, "錯誤", "Baud rate 須為整數")
+            messagebox.showwarning("錯誤", "Baud rate 須為整數")
             return
-        data_bits = int(self.data_combo.currentText())
-        parity = self.PARITIES[self.parity_combo.currentIndex()][1]
-        stop = self.STOP_BITS[self.stop_combo.currentIndex()][1]
+        try:
+            data_bits = int(self.data_var.get())
+        except ValueError:
+            messagebox.showwarning("錯誤", "Data bits 須為整數")
+            return
+        parity = self._parity_code()
+        stop = self._stop_value()
         try:
             self.ser = Serial(
-                port=device, baudrate=baud, bytesize=data_bits,
-                parity=parity, stopbits=stop, timeout=0, write_timeout=1,
+                port=device,
+                baudrate=baud,
+                bytesize=data_bits,
+                parity=parity,
+                stopbits=stop,
+                timeout=0,
+                write_timeout=1,
             )
-        except SerialException as e:
-            QMessageBox.critical(self, "開啟失敗", str(e))
+        except SerialException as exc:
+            messagebox.showerror("開啟失敗", str(exc))
             self.ser = None
             return
-        self.reader = SerialReader(self.ser)
-        self.reader.data_received.connect(self._on_data)
-        self.reader.error_occurred.connect(self._on_reader_error)
+        self.reader = SerialReader(self.ser, self.rx_queue)
         self.reader.start()
         self._set_connected(True)
-        self.statusBar().showMessage(f"已連線 {device}  {baud}-{data_bits}{parity}{stop}")
+        self.status_var.set(f"已連線 {device}  {baud}-{data_bits}{parity}{stop}")
 
-    def _close_port(self):
-        if self.btn_repeat_hex.isChecked():
-            self.btn_repeat_hex.setChecked(False)
-        if self.btn_repeat_ascii.isChecked():
-            self.btn_repeat_ascii.setChecked(False)
+    def _close_port(self) -> None:
+        if self._repeat_kind is not None:
+            self._stop_repeat()
         if self.reader is not None:
             self.reader.stop()
+            self.reader.join(0.8)
             self.reader = None
         if self.ser is not None:
             try:
                 self.ser.close()
-            except Exception:
+            except (SerialException, OSError):
                 pass
             self.ser = None
+        # 關閉時把 buffer 殘餘 flush 成最後一個 frame（避免下次 open 時看到舊資料）
+        if self._rx_buffer:
+            self._render_packet(bytes(self._rx_buffer))
+            self._rx_buffer.clear()
         self._set_connected(False)
-        self.statusBar().showMessage("未連線")
+        self.status_var.set("未連線")
 
-    def _set_connected(self, on: bool):
-        self.btn_open.setEnabled(not on)
-        self.btn_close.setEnabled(on)
-        for w in (self.port_combo, self.baud_combo, self.data_combo,
-                  self.parity_combo, self.stop_combo):
-            w.setEnabled(not on)
-        for w in (self.btn_send_hex, self.btn_send_ascii,
-                  self.btn_repeat_hex, self.btn_repeat_ascii):
-            w.setEnabled(on)
+    def _set_connected(self, on: bool) -> None:
+        state_cfg = ("disabled",) if on else ("!disabled",)
+        state_send = ("!disabled",) if on else ("disabled",)
+        self.btn_open.state(("disabled",) if on else ("!disabled",))
+        self.btn_close.state(("!disabled",) if on else ("disabled",))
+        for combo in (self.port_combo, self.baud_combo, self.data_combo, self.parity_combo, self.stop_combo):
+            combo.state(state_cfg)
+        for btn in (self.btn_send_hex, self.btn_send_ascii, self.btn_repeat_hex, self.btn_repeat_ascii):
+            btn.state(state_send)
 
-    def _ending_bytes(self) -> bytes:
-        data = self.end_combo.currentData()
-        return data if isinstance(data, (bytes, bytearray)) else b""
-
-    def _push_history(self, combo: QComboBox, text: str):
-        if not text:
-            return
-        idx = combo.findText(text)
-        if idx >= 0:
-            combo.removeItem(idx)
-        combo.insertItem(0, text)
-        combo.setCurrentIndex(0)
-        while combo.count() > self.HISTORY_MAX:
-            combo.removeItem(combo.count() - 1)
-
-    def _send_once(self, kind: str):
+    def _send_once(self, kind: str) -> None:
         if self.ser is None or not self.ser.is_open:
-            QMessageBox.warning(self, "錯誤", "尚未連線")
+            messagebox.showwarning("錯誤", "尚未連線")
             return
+        text = self.hex_input_var.get() if kind == "hex" else self.ascii_input_var.get()
         try:
             if kind == "hex":
-                text = self.hex_input.currentText()
-                data = parse_hex_input(text)
+                data = parse_hex(text)
                 if not data:
                     return
             else:
-                text = self.ascii_input.currentText()
                 data = text.encode("latin-1", errors="replace") + self._ending_bytes()
-        except ValueError as e:
-            QMessageBox.warning(self, "HEX 格式錯誤", str(e))
+        except ValueError as exc:
+            messagebox.showwarning("HEX 格式錯誤", str(exc))
             return
         try:
             self.ser.write(data)
-        except SerialException as e:
-            QMessageBox.critical(self, "發送失敗", str(e))
+        except SerialException as exc:
+            messagebox.showerror("發送失敗", str(exc))
             self._close_port()
             return
         self.tx_total += len(data)
-        self.lbl_tx_count.setText(f"發送: {self.tx_total} bytes")
-        if not self.tx_timer.isActive():
-            if kind == "hex":
-                self._push_history(self.hex_input, text)
-            else:
-                self._push_history(self.ascii_input, text)
+        self.tx_count_var.set(f"發送: {self.tx_total} bytes")
+        if self._repeat_kind is None:
+            self._push_history(kind, text)
 
-    def _toggle_repeat(self, kind: str, on: bool):
-        sender = self.btn_repeat_hex if kind == "hex" else self.btn_repeat_ascii
-        if on:
-            if self.ser is None or not self.ser.is_open:
-                QMessageBox.warning(self, "錯誤", "尚未連線")
-                sender.blockSignals(True); sender.setChecked(False); sender.blockSignals(False)
-                return
-            other = self.btn_repeat_ascii if kind == "hex" else self.btn_repeat_hex
-            if other.isChecked():
-                other.setChecked(False)
-            self._repeat_kind = kind
-            self.tx_timer.start(self.interval_spin.value())
-            sender.setText("停止")
-        else:
-            self.tx_timer.stop()
-            self._repeat_kind = None
-            self.btn_repeat_hex.setText("連續傳送")
-            self.btn_repeat_ascii.setText("連續傳送")
-
-    def _on_repeat_tick(self):
-        if self._repeat_kind is not None:
-            self._send_once(self._repeat_kind)
-
-    def _on_interval_changed(self, v: int):
-        if self.tx_timer.isActive():
-            self.tx_timer.setInterval(v)
-
-    def _on_data(self, data: bytes):
-        self.rx_total += len(data)
-        self.lbl_rx_count.setText(f"接收: {self.rx_total} bytes")
-        if self.chk_freeze.isChecked():
+    def _toggle_repeat(self, kind: str) -> None:
+        if self._repeat_kind == kind:
+            self._stop_repeat()
             return
-        self.rx_ascii.moveCursor(QTextCursor.End)
-        self.rx_ascii.insertPlainText(bytes_to_ascii(data))
-        self.dump_view.append(data)
-        if self.chk_autoscroll.isChecked():
+        if self.ser is None or not self.ser.is_open:
+            messagebox.showwarning("錯誤", "尚未連線")
+            return
+        self._stop_repeat()
+        self._repeat_kind = kind
+        if kind == "hex":
+            self.btn_repeat_hex.configure(text="停止")
+        else:
+            self.btn_repeat_ascii.configure(text="停止")
+        self._schedule_repeat()
+
+    def _stop_repeat(self) -> None:
+        if self._repeat_after_id is not None:
+            try:
+                self.root.after_cancel(self._repeat_after_id)
+            except tk.TclError:
+                pass
+            self._repeat_after_id = None
+        self._repeat_kind = None
+        self.btn_repeat_hex.configure(text="連續傳送")
+        self.btn_repeat_ascii.configure(text="連續傳送")
+
+    def _schedule_repeat(self) -> None:
+        if self._repeat_kind is None:
+            return
+        try:
+            interval = max(10, int(self.interval_var.get()))
+        except (tk.TclError, ValueError):
+            interval = 1000
+        self._repeat_after_id = self.root.after(interval, self._repeat_tick)
+
+    def _repeat_tick(self) -> None:
+        if self._repeat_kind is None:
+            return
+        kind = self._repeat_kind
+        self._send_once(kind)
+        if self._repeat_kind == kind:
+            self._schedule_repeat()
+
+    def _poll_queue(self) -> None:
+        rendered_any = False
+        # Step 1: 把 queue 裡的 raw bytes 吃進 buffer，更新 byte 計數
+        while True:
+            try:
+                data = self.rx_queue.get_nowait()
+            except queue.Empty:
+                break
+            if data == b"" and self.reader is not None and self.reader.error:
+                err = self.reader.error
+                self.reader.error = None
+                self._close_port()
+                messagebox.showwarning("Serial 錯誤", err)
+                self._rx_buffer.clear()
+                break
+            if not data:
+                continue
+            self.rx_total += len(data)
+            self.rx_count_var.set(f"接收: {self.rx_total} bytes")
+            self._rx_buffer.extend(data)
+            self._rx_last_byte_time = time.monotonic()
+
+        # Step 2: 根據封包邊界模式從 buffer 切 frame
+        if not self.freeze_var.get():
+            for pkt in self._extract_frames():
+                self._render_packet(pkt)
+                rendered_any = True
+
+        if rendered_any and self.autoscroll_var.get():
             for w in (self.rx_ascii, self.rx_hex, self.rx_both):
-                sb = w.verticalScrollBar()
-                sb.setValue(sb.maximum())
+                w.see("end")
 
-    def _on_reader_error(self, msg: str):
-        QMessageBox.warning(self, "Serial 錯誤", msg)
-        self._close_port()
+        self.root.after(POLL_INTERVAL_MS, self._poll_queue)
 
-    def _clear_rx(self):
+    def _extract_frames(self) -> list[bytes]:
+        """依目前 mode 從 self._rx_buffer 切出可顯示的 frame list（已從 buffer 移除）。"""
+        if not self._rx_buffer:
+            return []
+        mode = self.frame_mode_var.get()
+        frames: list[bytes] = []
+
+        if mode == "即時":
+            # 每個 poll tick 把 buffer 整包 flush，相當於「OS 給多少就一筆」
+            frames.append(bytes(self._rx_buffer))
+            self._rx_buffer.clear()
+        elif mode == "依分隔符":
+            term = self._parse_terminator(self.frame_term_var.get())
+            if not term:
+                # 分隔符無效，全部 flush 當一個 frame
+                frames.append(bytes(self._rx_buffer))
+                self._rx_buffer.clear()
+            else:
+                buf = bytes(self._rx_buffer)
+                while True:
+                    idx = buf.find(term)
+                    if idx < 0:
+                        break
+                    frames.append(buf[: idx + len(term)])
+                    buf = buf[idx + len(term):]
+                self._rx_buffer = bytearray(buf)
+                # 保險絲：buffer 太大強制 flush 避免無限累積（一直沒收到分隔符）
+                if len(self._rx_buffer) >= MAX_FRAME_BYTES:
+                    frames.append(bytes(self._rx_buffer))
+                    self._rx_buffer.clear()
+        else:
+            # 依閒置時間（也是 fallback）
+            try:
+                idle_ms = max(MIN_IDLE_MS, int(self.frame_idle_var.get()))
+            except (tk.TclError, ValueError):
+                idle_ms = DEFAULT_IDLE_MS
+            idle_sec = idle_ms / 1000.0
+            if (time.monotonic() - self._rx_last_byte_time) >= idle_sec:
+                frames.append(bytes(self._rx_buffer))
+                self._rx_buffer.clear()
+        return frames
+
+    def _parse_terminator(self, text: str) -> bytes:
+        """把使用者輸入的 `\\r\\n` / `\\x0A` 之類字串轉成實際 bytes。"""
+        text = text.strip()
+        if not text:
+            return b""
+        try:
+            return codecs.decode(text, "unicode_escape").encode("latin-1", errors="replace")
+        except (UnicodeDecodeError, ValueError):
+            return b""
+
+    def _render_packet(self, data: bytes) -> None:
+        """把一個 frame 寫進三個顯示分頁。"""
+        if not data:
+            return
+        n = len(data)
+        self.rx_packet_idx += 1
+        segments = bytes_to_ascii_inline_segments(data)
+        hex_str = bytes_to_hex(data)
+        suffix = f" (R{n}, #{self.rx_packet_idx})\n"
+
+        for text, is_esc in segments:
+            self.rx_ascii.insert("end", text, (ESC_TAG,) if is_esc else ())
+        self.rx_ascii.insert("end", suffix)
+
+        self.rx_hex.insert("end", hex_str + suffix)
+
+        for text, is_esc in segments:
+            self.rx_both.insert("end", text, (ESC_TAG,) if is_esc else ())
+        self.rx_both.insert("end", "  |  " + hex_str + suffix)
+
+        self.ascii_limiter.trim()
+        self.hex_limiter.trim()
+        self.both_limiter.trim()
+
+    def _clear_rx(self) -> None:
         self.rx_total = 0
-        self.rx_ascii.clear()
-        self.rx_hex.clear()
-        self.rx_both.clear()
-        self.dump_view.reset()
-        self.lbl_rx_count.setText("接收: 0 bytes")
-
-    def _on_max_lines_changed(self, v: int):
+        self.rx_packet_idx = 0
+        self._rx_buffer.clear()
         for w in (self.rx_ascii, self.rx_hex, self.rx_both):
-            w.setMaximumBlockCount(v)
+            w.delete("1.0", "end")
+        self.rx_count_var.set("接收: 0 bytes")
 
-    def closeEvent(self, ev):
+    def _on_max_lines_changed(self) -> None:
+        try:
+            v = int(self.max_lines_var.get())
+        except (tk.TclError, ValueError):
+            return
+        for limiter in (self.ascii_limiter, self.hex_limiter, self.both_limiter):
+            limiter.set_max(v)
+            limiter.trim()
+
+    def _on_close(self) -> None:
         self._close_port()
-        super().closeEvent(ev)
+        self.root.destroy()
 
 
-def main():
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+def main() -> int:
+    root = tk.Tk()
+    SerialApp(root)
+    root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,12 +1,15 @@
-"""
-Network Scanner GUI
-- Tab 1: IP Range Scan (ping sweep + common port probe)
-- Tab 2: Port Scan (single target, full port range)
-- Tab 3: Ping Monitor (continuous ping on single host with timeline log)
+"""網路掃描器（tkinter）。
 
-Pure standard library (tkinter + socket + subprocess + concurrent.futures).
-Run: python network_scanner.py
+分頁：
+- IP Range Scan：IP 區段 ping sweep + 常見 port 探測
+- Port Scan：單目標、全 port 範圍掃描
+- Ping Monitor：對單一主機持續 ping 並記錄時間軸
+
+純標準函式庫（tkinter + socket + subprocess + concurrent.futures）。
+執行：python network_scanner.py
 """
+
+from __future__ import annotations
 
 import ipaddress
 import os
@@ -20,7 +23,7 @@ import time
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 
 # Common ports shown as columns in IP scan

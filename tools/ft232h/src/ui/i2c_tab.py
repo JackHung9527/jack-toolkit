@@ -6,9 +6,10 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
-from ..core.i2c_ctrl import I2cCtrl, DEFAULT_FREQUENCY
+from common.hex_utils import format_hex, parse_hex
+
 from ..core.device import default_url
-from .hexutil import parse_hex, format_hex
+from ..core.i2c_ctrl import DEFAULT_FREQUENCY, I2cCtrl
 
 
 class I2cTab(ttk.Frame):

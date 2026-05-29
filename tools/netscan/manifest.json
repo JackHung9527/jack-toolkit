@@ -1,0 +1,8 @@
+{
+  "name": "netscan",
+  "display_name": "網路掃描器",
+  "description": "IP range ping sweep、port scan、ping monitor 含狀態統計",
+  "entry": "network_scanner.py",
+  "framework": "tkinter",
+  "requirements": null
+}

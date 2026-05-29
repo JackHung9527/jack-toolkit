@@ -1,0 +1,8 @@
+{
+  "name": "ft232h",
+  "display_name": "FT232H 測試器",
+  "description": "FT232H USB 轉 GPIO / SPI / I2C 桌面測試介面（Windows 需先用 Zadig 換 libusbK driver）",
+  "entry": "main.py",
+  "framework": "tkinter",
+  "requirements": null
+}

@@ -6,9 +6,10 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable
 
-from ..core.spi_ctrl import SpiCtrl, CS_LINE_COUNT, DEFAULT_FREQUENCY
+from common.hex_utils import format_hex, parse_hex
+
 from ..core.device import default_url
-from .hexutil import parse_hex, format_hex
+from ..core.spi_ctrl import CS_LINE_COUNT, DEFAULT_FREQUENCY, SpiCtrl
 
 
 class SpiTab(ttk.Frame):

@@ -1,7 +1,6 @@
-# FT232H Tester
+# FT232H 測試器 (FT232H Tester)
 
-FT232H USB 轉 GPIO / SPI / I2C 模組的桌面測試工具。
-以 Python + Tkinter 撰寫，可直接執行原始碼，也可用 PyInstaller 打包成單檔 `.exe`。
+FT232H USB 轉 GPIO / SPI / I2C 模組的桌面測試工具。Python + tkinter。
 
 ## 功能
 
@@ -9,7 +8,7 @@ FT232H USB 轉 GPIO / SPI / I2C 模組的桌面測試工具。
 - **GPIO 分頁**：16 個 pin（AD0–AD7、AC0–AC7）各別設方向、寫值、即時讀回（可 200ms 自動 poll）
 - **SPI 分頁**：CS0–CS4、mode 0/1/2/3、頻率可調、支援 Write / Read / Exchange（含 full-duplex）
 - **I2C 分頁**：100 k / 400 k / 1 M Hz、bus scan、register 與 raw read/write
-- 共用 hex 輸入解析（`DE AD BE EF`、`deadbeef`、`0xDE,0xAD` 皆可）
+- 共用 hex 輸入解析（`DE AD BE EF`、`deadbeef`、`0xDE,0xAD` 皆可），來自 `common/hex_utils.py`
 - 底部 log 視窗：含時間戳、INFO / OK / WARN / ERR 顏色標記
 
 ## FT232H pinout 速查
@@ -36,67 +35,47 @@ FT232H 出廠 driver 是 FTDI VCP（虛擬序列埠），`pyftdi` 走的是 libu
 6. 完成後可在裝置管理員中看到 `libusbK USB Devices → FT232H`
 
 > 如果同一台板子上的 FT232H 之後還要在 Arduino IDE / FTDI VCP 用，可在裝置管理員把 driver 換回 `FTDI USB Serial`，要回 libusb 再用 Zadig 切回去。
+> `tools/install_driver.ps1` 內有自動下載 Zadig 的腳本可參考。
 
-## 從原始碼執行（開發模式）
+## 執行
 
-需求：Python 3.9+
-
-```powershell
-# Windows PowerShell
-.\run.ps1
-```
-
-第一次執行會自動建立 `.venv` 並安裝相依套件。之後再執行就直接啟動。
-
-手動模式：
+從 jack-toolkit 根目錄安裝依賴後直接執行：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+# 在 jack-toolkit/ 根目錄
 pip install -r requirements.txt
-python main.py
+python tools/ft232h/main.py
 ```
 
-## 打包成 .exe
+或從 launcher 啟動：
 
 ```powershell
-.\build_exe.ps1
+python launcher.py
 ```
 
-產出位置：`dist\FT232H_Tester.exe`（單檔，雙擊即可開啟）。
-
-打包腳本會：
-
-1. 建立或重用 `.venv`
-2. 安裝 `requirements.txt`
-3. 清掉舊的 `build/` 與 `dist/`
-4. 用 `ft232h_tester.spec` 跑 PyInstaller（已內建 libusb-package 的 DLL 與 pyftdi 的 data files）
-
-預設 `console=False`（純 GUI，不開 console 視窗）。若要看 stderr 訊息，把 `ft232h_tester.spec` 內 `console=False` 改為 `True` 再重打包。
+需要 Python 3.9 以上。
 
 ## 專案結構
 
 ```
-FT232H/
-├── main.py                  # 入口（同時用於開發與 PyInstaller）
-├── requirements.txt
-├── ft232h_tester.spec       # PyInstaller spec
-├── build_exe.ps1            # 一鍵打包
-├── run.ps1                  # 一鍵啟動（開發）
+ft232h/
+├── main.py                 # 入口（套用 libusb backend fix 後啟動 MainWindow）
+├── manifest.json
+├── README.md
 ├── src/
 │   ├── core/
-│   │   ├── device.py        # 裝置掃描 / URL 管理
-│   │   ├── gpio_ctrl.py     # 16-bit GPIO 控制
-│   │   ├── spi_ctrl.py      # SPI master
-│   │   └── i2c_ctrl.py      # I2C master
+│   │   ├── device.py       # 裝置掃描 / URL 管理
+│   │   ├── gpio_ctrl.py    # 16-bit GPIO 控制
+│   │   ├── spi_ctrl.py     # SPI master
+│   │   └── i2c_ctrl.py     # I2C master
 │   └── ui/
-│       ├── main_window.py   # 主視窗 + 分頁框架
+│       ├── main_window.py  # 主視窗 + 分頁框架
 │       ├── gpio_tab.py
-│       ├── spi_tab.py
-│       ├── i2c_tab.py
-│       ├── log_panel.py     # 共用 log widget
-│       └── hexutil.py       # hex 字串解析
-└── README.md
+│       ├── spi_tab.py      # 使用 common.hex_utils
+│       ├── i2c_tab.py      # 使用 common.hex_utils
+│       └── log_panel.py    # 共用 log widget
+└── tools/
+    └── install_driver.ps1  # 自動下載 Zadig 換 driver 的輔助腳本
 ```
 
 ## 已知限制
@@ -104,7 +83,3 @@ FT232H/
 - 一個 FT232H 同一時間只能跑 **一種** MPSSE 模式（GPIO、SPI、I2C 互斥）。切協議必須先按該分頁的 **Close**，再到另一個分頁按 **Open**。
 - I2C 必須外接 pull-up，否則 `Scan bus` 不會有任何結果或讀到全 0xFF。
 - 多顆 FT232H 同時插入時，FT232H 的 EEPROM 必須先燒入不同序號（用 FT_Prog），不然兩顆會搶用同一個 URL。
-
-## 授權
-
-MIT
