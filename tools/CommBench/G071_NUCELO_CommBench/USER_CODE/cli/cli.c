@@ -27,10 +27,11 @@ uint32_t
 
 /* ===== TX ring buffer ===== */
 static uint8_t  s_tx_buf[CLI_TX_BUF_SIZE];
-static volatile uint16_t s_tx_head = 0;       /* 寫入位置 */
-static volatile uint16_t s_tx_tail = 0;       /* 讀取位置 */
-static volatile uint8_t  s_tx_busy = 0;       /* HAL 正在送一個 byte 中 */
-static uint8_t           s_tx_byte = 0;       /* 正在送的 byte（HAL_UART_Transmit_IT 必須吃外部 buffer） */
+static volatile uint16_t s_tx_head = 0;       /* 寫入位置（cli_send 推進） */
+static volatile uint16_t s_tx_tail = 0;       /* 讀取位置（TxCpltCallback 推進） */
+static volatile uint8_t  s_tx_busy = 0;       /* HAL 正在送 chunk 中 */
+static volatile uint16_t s_tx_chunk_len = 0;  /* 目前送出去那段 chunk 的長度
+                                                 （TxCpltCallback 完成後用來推 tail） */
 
 
 /* ===== RX line buffer ===== */
@@ -205,22 +206,42 @@ void cli_TASK(Cli_TaskSel *task,
 
 
 /* ===========================================================================
- *  Internal: kick TX
+ *  Internal: kick TX (multi-byte chunk)
+ *
+ *  改善：原本一次只送 1 byte、靠 TxCpltCallback ISR 接力 kick 下一個，每 byte
+ *  之間有 50-100µs ISR latency gap。ST-Link VCP 對「一抖一抖」串流容易在 USB CDC
+ *  FIFO 邊界丟 byte（症狀：*IDN? 隨機丟 1-6 個前綴 byte）。
+ *
+ *  本版：每次抓 ring buffer 內最長連續可送區段（從 tail 到 head 或 ring end），
+ *  HAL_UART_Transmit_IT 一次送一整段。inter-byte gap 縮到 UART hardware level
+ *  （基本上零，TXE 觸發後 HAL ISR 直接寫下個 byte 到 TDR）。
  * ========================================================================= */
 static void cli_kick_tx(void)
 {
-    /* 只有一邊持有 s_tx_busy 寫權；用簡單 critical section 避免和 ISR 競賽 */
+    /* 確保 ISR 跟 cli_send 不會同時動 s_tx_busy / chunk_len */
     __disable_irq();
-    if (!s_tx_busy && (s_tx_head != s_tx_tail))
+    if (s_tx_busy || (s_tx_head == s_tx_tail))
     {
-        s_tx_byte = s_tx_buf[s_tx_tail];
-        s_tx_tail = (uint16_t)((s_tx_tail + 1U) % CLI_TX_BUF_SIZE);
-        s_tx_busy = 1;
         __enable_irq();
-        HAL_UART_Transmit_IT(&huart2, &s_tx_byte, 1);
         return;
     }
+    /* 算出從 tail 起算的「連續可送長度」（遇到 ring wrap 就送到 buffer 尾端為止） */
+    uint16_t chunk;
+    if (s_tx_head > s_tx_tail)
+    {
+        chunk = (uint16_t)(s_tx_head - s_tx_tail);
+    }
+    else
+    {
+        chunk = (uint16_t)(CLI_TX_BUF_SIZE - s_tx_tail);
+    }
+    s_tx_chunk_len = chunk;
+    s_tx_busy = 1;
     __enable_irq();
+
+    /* HAL 一次送 chunk byte。期間 buffer[tail..tail+chunk-1] 不可被覆蓋；
+     * 由 cli_send 的 ring-full 檢查保證 head 不會繞回踩到這段。 */
+    HAL_UART_Transmit_IT(&huart2, &s_tx_buf[s_tx_tail], chunk);
 }
 
 
@@ -242,11 +263,26 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance != USART2) return;
 
+    /* 推進 tail：剛剛 HAL 送完的是 [tail .. tail+chunk_len-1] 那段 */
+    uint16_t sent = s_tx_chunk_len;
+    s_tx_tail = (uint16_t)((s_tx_tail + sent) % CLI_TX_BUF_SIZE);
+    s_tx_chunk_len = 0;
+
+    /* 還有資料就 kick 下一個 chunk（同 cli_kick_tx 的邏輯，但已在 ISR 內不用再關 IRQ） */
     if (s_tx_head != s_tx_tail)
     {
-        s_tx_byte = s_tx_buf[s_tx_tail];
-        s_tx_tail = (uint16_t)((s_tx_tail + 1U) % CLI_TX_BUF_SIZE);
-        HAL_UART_Transmit_IT(&huart2, &s_tx_byte, 1);
+        uint16_t chunk;
+        if (s_tx_head > s_tx_tail)
+        {
+            chunk = (uint16_t)(s_tx_head - s_tx_tail);
+        }
+        else
+        {
+            chunk = (uint16_t)(CLI_TX_BUF_SIZE - s_tx_tail);
+        }
+        s_tx_chunk_len = chunk;
+        /* busy stays 1 */
+        HAL_UART_Transmit_IT(&huart2, &s_tx_buf[s_tx_tail], chunk);
     }
     else
     {

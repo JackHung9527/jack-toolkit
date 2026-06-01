@@ -19,7 +19,100 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Optional
 
+import re
+
 from ..core.scpi_client import ScpiClient, ScpiError
+
+
+# ====== PMBus 命令碼（給 _show_write_result 顯示用）======
+PMBUS_CMD_OP    = 0x01
+PMBUS_CMD_ONOFF = 0x02
+
+
+# ====== 韌體錯誤訊息翻譯 ======
+# 韌體會回 `ERR HAL=N bus_idle=M`、`ERR PEC mismatch ...`、`ERR usage: ...` 等
+# 把這些 raw text 翻成人話、給 UI 顯示
+
+def humanize_pmbus_error(text: str) -> dict:
+    """Parse 韌體 ERR 訊息成結構化資訊。
+
+    回傳 {kind, title, detail, advice, raw}:
+      - kind  : 'nack' / 'busy' / 'timeout' / 'pec' / 'usage' / 'unknown'
+      - title : 一行標題（給 Decoded 區頂端紅字）
+      - detail: 補充說明
+      - advice: 建議下一步動作（可空）
+      - raw   : 原始韌體 text
+    """
+    result = {
+        "kind": "unknown",
+        "title": "✗ 錯誤",
+        "detail": text,
+        "advice": "",
+        "raw": text,
+    }
+    u = text.upper()
+
+    if "HAL=" in u:
+        hal_m = re.search(r"HAL=(\d+)", text)
+        bi_m = re.search(r"bus_idle=(\d+)", text)
+        hal = int(hal_m.group(1)) if hal_m else -1
+        bi = int(bi_m.group(1)) if bi_m else -1
+
+        if hal == 1:
+            result["kind"] = "nack"
+            if bi == 1:
+                result["title"] = "✗ NACK — slave 沒有 ACK，但 bus 仍 idle"
+                result["detail"] = (
+                    "I2C 主機送出 START + 位址 + R/W bit，但 slave 沒有 ACK 回應。\n"
+                    "常見原因：\n"
+                    "  (1) Slave 位址錯（你設的 0x__ 跟 DUT 實際位址不同）\n"
+                    "  (2) DUT 沒上電 / 沒接好 SCL / SDA / GND\n"
+                    "  (3) PMBus device 不支援這個 command code\n"
+                    "  (4) 沒接 4.7k pull-up 或上拉電壓不夠")
+                result["advice"] = "先確認 slave addr 與 DUT 接線；可以按 I2C 分頁的 Scan 看看實際抓到哪些位址"
+            else:
+                result["title"] = "✗ NACK + bus 卡 low — slave 異常"
+                result["detail"] = (
+                    "Slave 沒 ACK，並且 SCL 或 SDA 還被拉 low（bus 沒回到 idle）。\n"
+                    "可能 slave clock-stretch 過久卡住、或硬體問題。")
+                result["advice"] = "按 I2C 分頁的 Recover bus 救一次，再試"
+        elif hal == 2:
+            result["kind"] = "busy"
+            result["title"] = "✗ I2C peripheral BUSY"
+            result["detail"] = "STM32 端的 I2C 周邊還在前一個操作中；通常 ms 內會自己清掉"
+            result["advice"] = "稍候再按一次按鈕"
+        elif hal == 3:
+            result["kind"] = "timeout"
+            result["title"] = "✗ TIMEOUT — slave 沒在時限內完成"
+            if bi == 1:
+                result["detail"] = "Slave 太慢或 clock-stretch 過久；bus 仍 idle"
+            else:
+                result["detail"] = "Slave 太慢且把 bus 拉 low 卡住"
+                result["advice"] = "Recover bus 後再試"
+        else:
+            result["title"] = f"✗ HAL 錯誤 (code={hal})"
+    elif "PEC MISMATCH" in u:
+        result["kind"] = "pec"
+        result["title"] = "✗ PEC 對不上 — CRC-8 驗證失敗"
+        # 從原 text 抽 data/rx/calc
+        m = re.search(r"data=0x(\w+).*rx=0x(\w+).*calc=0x(\w+)", text, re.I)
+        if m:
+            result["detail"] = (
+                f"slave 回傳 data=0x{m.group(1).upper()}、PEC byte=0x{m.group(2).upper()}\n"
+                f"但我們算出來應該是 0x{m.group(3).upper()}")
+        else:
+            result["detail"] = text
+        result["advice"] = "chip 端 PEC 沒開、或我們的 CRC8 計算跟 chip 不一致；先試試關掉 PEC 看 data 對不對"
+    elif "USAGE:" in u:
+        result["kind"] = "usage"
+        result["title"] = "✗ 命令格式錯"
+        result["detail"] = text
+    elif "PORT NOT OPEN" in u:
+        result["kind"] = "noport"
+        result["title"] = "✗ COM port 未開"
+        result["detail"] = "host 跟韌體之間的 serial 連線斷了；按主視窗 Open 重連"
+
+    return result
 
 
 # ====== PMBus STATUS_WORD bit names (16-bit) ======
@@ -292,7 +385,8 @@ class PmbusTab(ttk.Frame):
                 b = self._client.pmbus_op_read(addr, pec=pec_now)
             except ScpiError as exc:
                 self._log(str(exc), "ERR")
-                self.after(0, lambda: self._show_err(f"OPERATION read failed: {exc}"))
+                self.after(0, lambda: self._show_err(
+                    str(exc), prefix="OPERATION (0x01) 讀取失敗"))
                 return
             self._log(f"OPERATION = 0x{b:02X}", "RX")
 
@@ -326,7 +420,8 @@ class PmbusTab(ttk.Frame):
                 b = self._client.pmbus_onoff_read(addr, pec=pec_now)
             except ScpiError as exc:
                 self._log(str(exc), "ERR")
-                self.after(0, lambda: self._show_err(f"ON_OFF_CONFIG read failed: {exc}"))
+                self.after(0, lambda: self._show_err(
+                    str(exc), prefix="ON_OFF_CONFIG (0x02) 讀取失敗"))
                 return
             self._log(f"ON_OFF_CONFIG = 0x{b:02X}", "RX")
 
@@ -354,7 +449,8 @@ class PmbusTab(ttk.Frame):
                 w = self._client.pmbus_status_word(addr, pec=pec_now)
             except ScpiError as exc:
                 self._log(str(exc), "ERR")
-                self.after(0, lambda: self._show_err(f"STATUS_WORD read failed: {exc}"))
+                self.after(0, lambda: self._show_err(
+                    str(exc), prefix="STATUS_WORD (0x79) 讀取失敗"))
                 return
             self._log(f"STATUS_WORD = 0x{w:04X}", "RX")
 
@@ -393,7 +489,8 @@ class PmbusTab(ttk.Frame):
                 raw, part1, part2 = self._client.pmbus_revision(addr, pec=pec_now)
             except ScpiError as exc:
                 self._log(str(exc), "ERR")
-                self.after(0, lambda: self._show_err(f"PMBUS_REVISION read failed: {exc}"))
+                self.after(0, lambda: self._show_err(
+                    str(exc), prefix="PMBUS_REVISION (0x98) 讀取失敗"))
                 return
             self._log(f"PMBUS_REVISION = 0x{raw:02X}", "RX")
 
@@ -425,7 +522,8 @@ class PmbusTab(ttk.Frame):
                 data = self._client.pmbus_mfr_revision(addr, pec=pec_now)
             except ScpiError as exc:
                 self._log(str(exc), "ERR")
-                self.after(0, lambda: self._show_err(f"MFR_REVISION read failed: {exc}"))
+                self.after(0, lambda: self._show_err(
+                    str(exc), prefix="MFR_REVISION (0x9B) 讀取失敗"))
                 return
 
             ascii_repr = "".join(
@@ -463,10 +561,24 @@ class PmbusTab(ttk.Frame):
                 self._client.pmbus_op_write(addr, b, pec=pec_now)
             except ScpiError as exc:
                 self._log(str(exc), "ERR")
+                self.after(0, lambda: self._show_write_result(
+                    "OPERATION", PMBUS_CMD_OP, b, None, error=str(exc)))
                 return
-            self._log(f"OPERATION ← 0x{b:02X}", "OK")
-            # 寫完自動 read-back 看實際值
-            self._on_read_op()
+            self._log(f"OPERATION ← 0x{b:02X}  寫入 OK", "OK")
+
+            # inline read-back（同一個 worker thread，不再 _run_bg 避免被 busy 擋）
+            try:
+                rb = self._client.pmbus_op_read(addr, pec=pec_now)
+            except ScpiError as exc:
+                self._log(f"OPERATION read-back 失敗: {exc}", "WARN")
+                self.after(0, lambda: self._show_write_result(
+                    "OPERATION", PMBUS_CMD_OP, b, None, error=f"read-back: {exc}"))
+                return
+            match = (rb == b)
+            self._log(f"OPERATION read-back = 0x{rb:02X}  ({'MATCH' if match else 'MISMATCH'})",
+                      "OK" if match else "WARN")
+            self.after(0, lambda: self._show_write_result(
+                "OPERATION", PMBUS_CMD_OP, b, rb, fields=decode_operation(rb)))
 
         self._run_bg(do)
 
@@ -485,11 +597,84 @@ class PmbusTab(ttk.Frame):
                 self._client.pmbus_onoff_write(addr, b, pec=pec_now)
             except ScpiError as exc:
                 self._log(str(exc), "ERR")
+                self.after(0, lambda: self._show_write_result(
+                    "ON_OFF_CONFIG", PMBUS_CMD_ONOFF, b, None, error=str(exc)))
                 return
-            self._log(f"ON_OFF_CONFIG ← 0x{b:02X}", "OK")
-            self._on_read_onoff()
+            self._log(f"ON_OFF_CONFIG ← 0x{b:02X}  寫入 OK", "OK")
+
+            try:
+                rb = self._client.pmbus_onoff_read(addr, pec=pec_now)
+            except ScpiError as exc:
+                self._log(f"ON_OFF_CONFIG read-back 失敗: {exc}", "WARN")
+                self.after(0, lambda: self._show_write_result(
+                    "ON_OFF_CONFIG", PMBUS_CMD_ONOFF, b, None, error=f"read-back: {exc}"))
+                return
+            match = (rb == b)
+            self._log(f"ON_OFF_CONFIG read-back = 0x{rb:02X}  ({'MATCH' if match else 'MISMATCH'})",
+                      "OK" if match else "WARN")
+            self.after(0, lambda: self._show_write_result(
+                "ON_OFF_CONFIG", PMBUS_CMD_ONOFF, b, rb, fields=decode_on_off_config(rb)))
 
         self._run_bg(do)
 
-    def _show_err(self, msg: str) -> None:
-        self._show_result_lines([(msg, "err")])
+    def _show_err(self, msg: str, *, prefix: str = "") -> None:
+        """顯示錯誤到 Decoded 區。先嘗試 humanize，無法解析就 raw print。"""
+        info = humanize_pmbus_error(msg)
+        out: list[tuple[str, str]] = []
+        if prefix:
+            out.append((prefix, "head"))
+            out.append(("", ""))
+        out.append((info["title"], "err"))
+        out.append(("", ""))
+        for line in info["detail"].split("\n"):
+            out.append((f"  {line}", "warn"))
+        if info["advice"]:
+            out.append(("", ""))
+            out.append((f"建議：{info['advice']}", "warn"))
+        out.append(("", ""))
+        out.append((f"原始韌體訊息：{info['raw']}", "dim"))
+        self._show_result_lines(out)
+
+    def _show_write_result(self, name: str, cmd_code: int, written: int,
+                           read_back: Optional[int],
+                           fields: Optional[list[tuple[str, str]]] = None,
+                           error: Optional[str] = None) -> None:
+        """寫入操作的結果顯示，給 Decoded 區用 — 比起只在 log 印一行 OK，這個能讓
+        使用者「立刻看到 write 有沒有真的被 chip 接受」。
+        """
+        out: list[tuple[str, str]] = [
+            (f"{name} (0x{cmd_code:02X}) 寫入操作", "head"),
+            ("", ""),
+            (f"  寫入值      : 0x{written:02X}  (binary {written:08b})", ""),
+        ]
+        if error is not None:
+            info = humanize_pmbus_error(error)
+            out.append(("", ""))
+            out.append((info["title"], "err"))
+            out.append(("", ""))
+            for line in info["detail"].split("\n"):
+                out.append((f"  {line}", "warn"))
+            if info["advice"]:
+                out.append(("", ""))
+                out.append((f"建議：{info['advice']}", "warn"))
+            out.append(("", ""))
+            out.append((f"原始韌體訊息：{info['raw']}", "dim"))
+        elif read_back is None:
+            out.append((f"  狀態        : ⚠ 寫入 OK 但無法 read-back 驗證", "warn"))
+        else:
+            match = (read_back == written)
+            out.append((f"  read-back   : 0x{read_back:02X}  (binary {read_back:08b})",
+                        "ok" if match else "warn"))
+            out.append(("", ""))
+            if match:
+                out.append(("✓ 寫入成功且 chip 套用了新值（寫入值 == read-back）", "ok"))
+            else:
+                out.append(("⚠ 寫入後 read-back 不同！chip 可能拒絕、或某些 bit 被遮罩 / 唯讀",
+                            "warn"))
+            # 若有 bit-level decoded 資訊就一起顯示，方便看 chip 實際生效的狀態
+            if fields:
+                out.append(("", ""))
+                out.append((f"read-back 解碼：", "head"))
+                for fname, fval in fields:
+                    out.append((f"  {fname:30s}  {fval}", ""))
+        self._show_result_lines(out)

@@ -214,22 +214,29 @@ class ScpiClient:
     def _drain_input(self, timeout_per_read_s: float = 0.08) -> str:
         """把當前 input buffer 內的所有資料拉光。
 
-        timeout_per_read_s 拉長到 80ms 可以容忍 USB CDC scheduling 抖動
-        （ST-Link VCP 常常一輪一輪丟，中間隔 20-50ms）。
+        改用 `ser.in_waiting` poll（與 _read_lines_until_idle 同樣思路）：
+        不依賴 ser.read 的 timeout/wake 行為，避免 Windows pyserial 第一次 read
+        後剩餘 byte 卡在 OS buffer 沒被讀到的問題。
         """
         ser = self._ser
         if ser is None:
             return ""
         chunks: list[bytes] = []
-        ser.timeout = timeout_per_read_s
-        try:
-            while True:
-                data = ser.read(512)
-                if not data:
+        deadline = time.monotonic() + timeout_per_read_s
+        last_data_time = time.monotonic()
+        while time.monotonic() < deadline:
+            n = ser.in_waiting
+            if n > 0:
+                data = ser.read(n)
+                if data:
+                    chunks.append(data)
+                    last_data_time = time.monotonic()
+                    # 連續有資料時不要太早 deadline，給多一點時間
+                    deadline = max(deadline, last_data_time + timeout_per_read_s)
+            else:
+                if chunks and (time.monotonic() - last_data_time) > 0.02:
                     break
-                chunks.append(data)
-        finally:
-            ser.timeout = DEFAULT_TIMEOUT_S
+                time.sleep(0.003)
         return b"".join(chunks).decode("utf-8", errors="replace")
 
     def _write_line(self, line: str) -> None:
@@ -243,27 +250,40 @@ class ScpiClient:
     def _read_lines_until_idle(self, idle_ms: int = 120, max_wait_s: float = 3.0) -> list[str]:
         """讀 response 直到沒有新資料持續 idle_ms 為止。
 
-        韌體可能對一條命令回多行（例如 HELP? 有 N 行），所以不能只讀一行；
-        改用「沒看到新資料超過 idle_ms」當結束條件。
+        歷史 bug（v1）：用 `ser.timeout = idle_ms/1000` 然後 `ser.read(512)` 一次。
+        Windows pyserial 對 `ser.read(N)` 的 timeout 行為：第一次 read OS COMM
+        event wake 就 return（可能只拿部分 byte），剩餘 byte 留在 OS buffer；
+        後續 read 因為已 consume 過 event，要等下次 event 才會 wake，結果空等到
+        timeout 就 break，剩下的 byte 被丟掉。症狀：*IDN? 隨機丟前綴/中間 byte，
+        實測 30 次只 3 次完整。
+
+        v2 修法：用 `ser.in_waiting` 主動 poll，知道確切有幾個 byte 待讀，
+        `ser.read(n_avail)` 一次拿乾淨，不依賴 ser.timeout 的 wake 行為。
+        idle 用我們自己的 monotonic clock 量。實測 30/30 全乾淨。
         """
         ser = self._ser
         if ser is None:
             raise ScpiError("port not open")
 
         end_deadline = time.monotonic() + max_wait_s
-        ser.timeout = idle_ms / 1000.0
-
+        idle_s = idle_ms / 1000.0
         buf = bytearray()
-        while True:
-            data = ser.read(512)
-            if data:
-                buf.extend(data)
-                continue
-            if time.monotonic() >= end_deadline:
-                break
-            break  # 一輪沒新資料就視為 idle 結束
+        last_data_time = time.monotonic()
 
-        ser.timeout = DEFAULT_TIMEOUT_S
+        while time.monotonic() < end_deadline:
+            n_avail = ser.in_waiting
+            if n_avail > 0:
+                data = ser.read(n_avail)
+                if data:
+                    buf.extend(data)
+                    last_data_time = time.monotonic()
+            else:
+                if buf and (time.monotonic() - last_data_time) > idle_s:
+                    break
+                if not buf and (time.monotonic() - last_data_time) > max_wait_s:
+                    break
+                time.sleep(0.005)
+
         text = buf.decode("utf-8", errors="replace")
         return [ln for ln in text.replace("\r\n", "\n").split("\n") if ln != ""]
 
