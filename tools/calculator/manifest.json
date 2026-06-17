@@ -1,0 +1,8 @@
+{
+  "name": "calculator",
+  "display_name": "小算盤",
+  "description": "仿 Windows 內建計算機（標準模式）：四則運算、記憶體鍵、平方/開根號/倒數/百分比、千分位顯示、完整鍵盤操作",
+  "entry": "main.py",
+  "framework": "tkinter",
+  "requirements": null
+}

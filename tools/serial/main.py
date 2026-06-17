@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import codecs
 import queue
-import re
 import sys
 import threading
 import time
@@ -65,8 +64,6 @@ DEFAULT_IDLE_MS = 50
 MIN_IDLE_MS = 1
 MAX_IDLE_MS = 2000
 DEFAULT_TERMINATORS = ("\\r\\n", "\\n", "\\r", "\\x00")
-# 截 USB hwid 只保留 VID:PID 段，砍掉 SER= LOCATION= 等
-_VID_PID_RE = re.compile(r"USB\s+VID:PID=[0-9A-Fa-f]+:[0-9A-Fa-f]+", re.IGNORECASE)
 BAUD_RATES = [
     "9600", "19200", "38400", "57600", "115200", "230400",
     "460800", "921600", "1200", "2400", "4800", "14400",
@@ -401,6 +398,9 @@ class SerialApp:
         except tk.TclError:
             pass
 
+        # 下拉清單（含 COM port 列表）字體放大，避免長描述擠在一起、行距太窄
+        root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 11))
+
         self._build_menu()
         self._build_ui()
         self._refresh_ports()
@@ -418,6 +418,9 @@ class SerialApp:
         tools_menu = tk.Menu(menubar, tearoff=False)
         tools_menu.add_command(label="程式設計師計算機  Ctrl+K", command=self._open_calculator)
         tools_menu.add_command(label="重新掃描通訊埠  F5", command=self._refresh_ports)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="通訊埠詳細資訊  Ctrl+I", command=self._show_port_details)
+        tools_menu.add_command(label="ASCII 對照表  Ctrl+T", command=self._show_ascii_table)
         menubar.add_cascade(label="工具(T)", menu=tools_menu, underline=3)
 
         help_menu = tk.Menu(menubar, tearoff=False)
@@ -428,6 +431,10 @@ class SerialApp:
         self.root.bind_all("<F5>", lambda _e: self._refresh_ports())
         self.root.bind_all("<Control-k>", lambda _e: self._open_calculator())
         self.root.bind_all("<Control-K>", lambda _e: self._open_calculator())
+        self.root.bind_all("<Control-i>", lambda _e: self._show_port_details())
+        self.root.bind_all("<Control-I>", lambda _e: self._show_port_details())
+        self.root.bind_all("<Control-t>", lambda _e: self._show_ascii_table())
+        self.root.bind_all("<Control-T>", lambda _e: self._show_ascii_table())
 
     def _build_ui(self) -> None:
         mono = tkfont.Font(family="Consolas", size=10)
@@ -692,21 +699,22 @@ class SerialApp:
             labels.append(self._ports[0].label)
         else:
             for p in ports:
-                parts = [p.device]
+                # 名稱：描述去掉與裝置名重複的 "(COMx)"
+                name = ""
                 if p.description and p.description != "n/a":
-                    parts.append(p.description)
-                tail = []
-                if p.manufacturer and p.manufacturer != "n/a" and (
-                    not p.description or p.manufacturer not in p.description
-                ):
-                    tail.append(f"[{p.manufacturer}]")
-                if p.hwid and p.hwid != "n/a":
-                    m = _VID_PID_RE.search(p.hwid)
-                    short = m.group(0) if m else p.hwid
-                    tail.append(f"{{{short}}}")
-                label = " - ".join(parts[:2])
-                if tail:
-                    label += "  " + "  ".join(tail)
+                    name = p.description
+                    suffix = f" ({p.device})"
+                    if name.endswith(suffix):
+                        name = name[: -len(suffix)]
+                    if len(name) > 20:                # 名稱過長截斷，超過 20 字以 ... 表示
+                        name = name[:20] + "..."
+                # 格式：COMx 名稱 V:1111 P:2222（V/P 為 USB VID/PID，非 USB 埠則省略）
+                bits = [p.device]
+                if name:
+                    bits.append(name)
+                if p.vid is not None and p.pid is not None:
+                    bits.append(f"V:{p.vid:04X} P:{p.pid:04X}")
+                label = " ".join(bits)
                 self._ports.append(PortInfo(p.device, label))
                 labels.append(label)
         self.port_combo["values"] = labels
@@ -717,6 +725,153 @@ class SerialApp:
                     break
         else:
             self.port_var.set(labels[0])
+
+    def _show_port_details(self) -> None:
+        """彈出視窗，完整列出所有 COM port 的 pyserial 欄位資訊。"""
+        win = tk.Toplevel(self.root)
+        win.title("通訊埠詳細資訊")
+        win.geometry("720x480")
+        win.transient(self.root)
+        try:
+            win.iconbitmap(default=str(Path(__file__).resolve().parent / "serial.ico"))
+        except Exception:
+            pass
+
+        bar = ttk.Frame(win, padding=(8, 6))
+        bar.pack(fill="x")
+        ttk.Label(bar, text="所有通訊埠完整資訊（pyserial 欄位）").pack(side="left")
+
+        body = ttk.Frame(win, padding=(8, 0, 8, 8))
+        body.pack(fill="both", expand=True)
+        txt = tk.Text(body, wrap="none", font=("Consolas", 10), bg="#ffffff",
+                      relief="flat", padx=8, pady=6)
+        yscroll = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        xscroll = ttk.Scrollbar(body, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        keys = ["device", "name", "description", "manufacturer", "product",
+                "vid", "pid", "serial_number", "location", "interface", "hwid"]
+
+        def build_text() -> str:
+            ports = list(list_ports.comports())
+            if not ports:
+                return "（找不到任何 COM port）"
+            out = [f"共 {len(ports)} 個通訊埠"]
+            for p in sorted(ports, key=lambda x: x.device):
+                out.append("")
+                out.append("─" * 58)
+                for k in keys:
+                    if k == "vid":
+                        val = f"0x{p.vid:04X}" if p.vid is not None else "-"
+                    elif k == "pid":
+                        val = f"0x{p.pid:04X}" if p.pid is not None else "-"
+                    else:
+                        v = getattr(p, k, None)
+                        val = str(v) if v not in (None, "", "n/a") else "-"
+                    out.append(f"  {k:<14}: {val}")
+            return "\n".join(out)
+
+        def fill() -> None:
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("1.0", build_text())
+            txt.configure(state="disabled")
+
+        def copy() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(build_text())
+
+        ttk.Button(bar, text="關閉", command=win.destroy).pack(side="right")
+        ttk.Button(bar, text="複製", command=copy).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="重新整理", command=fill).pack(side="right", padx=(0, 6))
+
+        fill()
+        _center_window(win)
+
+    def _show_ascii_table(self) -> None:
+        """彈出標準 ASCII (0-127) 對照表：DEC / HEX / BIN / 字元 / 說明。"""
+        ctrl = {
+            0: ("NUL", "Null 空字元"), 1: ("SOH", "Start of Heading"),
+            2: ("STX", "Start of Text"), 3: ("ETX", "End of Text"),
+            4: ("EOT", "End of Transmission"), 5: ("ENQ", "Enquiry"),
+            6: ("ACK", "Acknowledge"), 7: ("BEL", "Bell 響鈴"),
+            8: ("BS", "Backspace 退格"), 9: ("HT", "Tab 水平定位 \\t"),
+            10: ("LF", "Line Feed 換行 \\n"), 11: ("VT", "Vertical Tab"),
+            12: ("FF", "Form Feed"), 13: ("CR", "Carriage Return 回車 \\r"),
+            14: ("SO", "Shift Out"), 15: ("SI", "Shift In"),
+            16: ("DLE", "Data Link Escape"), 17: ("DC1", "Device Control 1 (XON)"),
+            18: ("DC2", "Device Control 2"), 19: ("DC3", "Device Control 3 (XOFF)"),
+            20: ("DC4", "Device Control 4"), 21: ("NAK", "Negative Acknowledge"),
+            22: ("SYN", "Synchronous Idle"), 23: ("ETB", "End of Trans. Block"),
+            24: ("CAN", "Cancel"), 25: ("EM", "End of Medium"),
+            26: ("SUB", "Substitute"), 27: ("ESC", "Escape"),
+            28: ("FS", "File Separator"), 29: ("GS", "Group Separator"),
+            30: ("RS", "Record Separator"), 31: ("US", "Unit Separator"),
+            32: ("SP", "Space 空白"), 127: ("DEL", "Delete 刪除"),
+        }
+
+        def row_for(c: int) -> tuple:
+            b = format(c, "08b")
+            binstr = b[:4] + " " + b[4:]
+            if c in ctrl:
+                ch, desc = ctrl[c]
+            else:
+                ch, desc = chr(c), ""
+            return (str(c), format(c, "02X"), binstr, ch, desc)
+
+        win = tk.Toplevel(self.root)
+        win.title("ASCII 對照表")
+        win.geometry("560x620")
+        win.transient(self.root)
+        try:
+            win.iconbitmap(default=str(Path(__file__).resolve().parent / "serial.ico"))
+        except Exception:
+            pass
+
+        bar = ttk.Frame(win, padding=(8, 6))
+        bar.pack(fill="x")
+        ttk.Label(bar, text="標準 ASCII (0-127)：DEC / HEX / BIN / 字元").pack(side="left")
+
+        body = ttk.Frame(win, padding=(8, 0, 8, 8))
+        body.pack(fill="both", expand=True)
+        ttk.Style(win).configure("Ascii.Treeview", font=("Consolas", 10), rowheight=20)
+        cols = ("dec", "hex", "bin", "char", "desc")
+        tree = ttk.Treeview(body, columns=cols, show="headings", style="Ascii.Treeview")
+        headings = {
+            "dec": ("DEC", 48, "e"), "hex": ("HEX", 48, "center"),
+            "bin": ("BIN", 92, "center"), "char": ("字元", 56, "center"),
+            "desc": ("說明", 250, "w"),
+        }
+        for c, (txt, w, anc) in headings.items():
+            tree.heading(c, text=txt)
+            tree.column(c, width=w, anchor=anc, stretch=(c == "desc"))
+        ysb = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ysb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        for c in range(128):
+            tag = "ctrl" if c in ctrl else "print"
+            tree.insert("", "end", values=row_for(c), tags=(tag,))
+        tree.tag_configure("ctrl", foreground="#9a6a00")
+
+        def copy() -> None:
+            lines = ["DEC\tHEX\tBIN\tCHAR\tDESC"]
+            lines += ["\t".join(row_for(c)) for c in range(128)]
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(lines))
+
+        ttk.Button(bar, text="關閉", command=win.destroy).pack(side="right")
+        ttk.Button(bar, text="複製", command=copy).pack(side="right", padx=(0, 6))
+
+        _center_window(win)
 
     def _selected_device(self) -> Optional[str]:
         label = self.port_var.get()
@@ -1026,9 +1181,23 @@ class SerialApp:
         self.root.destroy()
 
 
+def _center_window(win) -> None:
+    win.update_idletasks()
+    w = win.winfo_width() if win.winfo_width() > 1 else win.winfo_reqwidth()
+    h = win.winfo_height() if win.winfo_height() > 1 else win.winfo_reqheight()
+    x = max(0, (win.winfo_screenwidth() - w) // 2)
+    y = max(0, (win.winfo_screenheight() - h) // 2)
+    win.geometry(f"+{x}+{y}")
+
+
 def main() -> int:
     root = tk.Tk()
+    try:
+        root.iconbitmap(default=str(Path(__file__).resolve().parent / "serial.ico"))
+    except Exception:
+        pass
     SerialApp(root)
+    _center_window(root)
     root.mainloop()
     return 0
 

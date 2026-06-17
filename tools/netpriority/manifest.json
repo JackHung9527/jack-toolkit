@@ -1,0 +1,8 @@
+{
+  "name": "netpriority",
+  "display_name": "網路優先權",
+  "description": "列出所有網路介面的 IPv4 metric（優先權），可調整 / 一鍵降到最低 / 改回自動；套用走 UAC 提權",
+  "entry": "main.py",
+  "framework": "tkinter",
+  "requirements": null
+}

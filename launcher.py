@@ -48,6 +48,7 @@ def _global_excepthook(exc_type, exc_value, exc_tb) -> None:
 
 sys.excepthook = _global_excepthook
 
+import ctypes
 import json
 import runpy
 import subprocess
@@ -57,6 +58,7 @@ from tkinter import messagebox, ttk
 
 ROOT = Path(__file__).resolve().parent
 TOOLS_DIR = ROOT / "tools"
+LAUNCHER_ICO = ROOT / "launcher.ico"
 POLL_INTERVAL_MS = 500
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 
@@ -117,6 +119,16 @@ def _install_global_wheel(root: tk.Tk) -> None:
     root.bind_all("<Button-5>", _on_wheel)
 
 
+def _center_window(win) -> None:
+    """把視窗置中於螢幕（在 mainloop 前呼叫，視窗一出現就在中央）。"""
+    win.update_idletasks()
+    w = win.winfo_width() if win.winfo_width() > 1 else win.winfo_reqwidth()
+    h = win.winfo_height() if win.winfo_height() > 1 else win.winfo_reqheight()
+    x = max(0, (win.winfo_screenwidth() - w) // 2)
+    y = max(0, (win.winfo_screenheight() - h) // 2)
+    win.geometry(f"+{x}+{y}")
+
+
 @dataclass
 class Tool:
     name: str
@@ -125,11 +137,13 @@ class Tool:
     entry: Path
     framework: str
     cwd: Path
+    icon: Path | None
 
     @classmethod
     def from_manifest(cls, manifest_path: Path) -> "Tool":
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
         cwd = manifest_path.parent
+        icon_png = cwd / "icon.png"
         return cls(
             name=data["name"],
             display_name=data.get("display_name", data["name"]),
@@ -137,6 +151,7 @@ class Tool:
             entry=cwd / data["entry"],
             framework=data.get("framework", "?"),
             cwd=cwd,
+            icon=icon_png if icon_png.is_file() else None,
         )
 
 
@@ -181,12 +196,18 @@ class LauncherApp:
         self.tools = tools
         self.processes: list[tuple[Tool, subprocess.Popen[bytes], ttk.Frame]] = []
         self.empty_label: tk.Widget | None = None
+        self._card_images: list[tk.PhotoImage] = []  # 保留參照避免被 GC
 
         root.title("jack-toolkit launcher")
         root.geometry("900x520")
         root.minsize(720, 420)
+        try:
+            root.iconbitmap(default=str(LAUNCHER_ICO))
+        except Exception:
+            pass
 
         self._build_ui()
+        _center_window(root)
         _install_global_wheel(root)
         self._poll_processes()
 
@@ -291,16 +312,26 @@ class LauncherApp:
     def _make_card(self, parent: ttk.Widget, tool: Tool, idx: int) -> None:
         card = ttk.Frame(parent, padding=10, relief="groove", borderwidth=1)
         card.grid(row=idx, column=0, sticky="ew", pady=4)
-        card.columnconfigure(0, weight=1)
+        card.columnconfigure(1, weight=1)
+
+        # 工具圖示（icon.png 存在才顯示）
+        if tool.icon is not None:
+            try:
+                img = tk.PhotoImage(file=str(tool.icon))
+                self._card_images.append(img)
+                ttk.Label(card, image=img).grid(row=0, column=0, rowspan=3,
+                                                sticky="n", padx=(0, 10))
+            except Exception:
+                pass
 
         title = ttk.Label(card, text=tool.display_name, font=("Segoe UI", 11, "bold"))
-        title.grid(row=0, column=0, sticky="w")
+        title.grid(row=0, column=1, sticky="w")
 
         tag = ttk.Label(card, text=f"[{tool.framework}]", foreground="#369")
-        tag.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        tag.grid(row=0, column=2, sticky="e", padx=(8, 0))
 
-        desc = ttk.Label(card, text=tool.description, foreground="#444", wraplength=440)
-        desc.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 6))
+        desc = ttk.Label(card, text=tool.description, foreground="#444", wraplength=420)
+        desc.grid(row=1, column=1, columnspan=2, sticky="w", pady=(2, 6))
 
         path = ttk.Label(
             card,
@@ -308,10 +339,10 @@ class LauncherApp:
             foreground="#888",
             font=("Consolas", 9),
         )
-        path.grid(row=2, column=0, sticky="w")
+        path.grid(row=2, column=1, sticky="w")
 
         btn = ttk.Button(card, text="啟動", command=lambda t=tool: self._launch(t))
-        btn.grid(row=2, column=1, sticky="e")
+        btn.grid(row=2, column=2, sticky="e")
 
     def _launch(self, tool: Tool) -> None:
         if not IS_FROZEN and not tool.entry.is_file():
@@ -420,11 +451,22 @@ class LauncherApp:
         )
 
 
+def _enable_dpi_awareness() -> None:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def main() -> int:
     # --tool <name>：dispatch 模式（給 frozen exe 重入用，source 模式也可直接呼叫）
     if len(sys.argv) >= 3 and sys.argv[1] == "--tool":
         return dispatch_tool(sys.argv[2])
 
+    _enable_dpi_awareness()
     tools = discover_tools()
     root = tk.Tk()
     LauncherApp(root, tools)

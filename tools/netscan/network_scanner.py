@@ -948,10 +948,23 @@ class PingMonitorFrame(ttk.Frame):
 # Main
 # ---------------------------------------------------------------------------
 
+def _center_window(win) -> None:
+    win.update_idletasks()
+    w = win.winfo_width() if win.winfo_width() > 1 else win.winfo_reqwidth()
+    h = win.winfo_height() if win.winfo_height() > 1 else win.winfo_reqheight()
+    x = max(0, (win.winfo_screenwidth() - w) // 2)
+    y = max(0, (win.winfo_screenheight() - h) // 2)
+    win.geometry(f"+{x}+{y}")
+
+
 def main():
     root = tk.Tk()
     root.title("Network Scanner")
     root.geometry("1080x560")
+    try:
+        root.iconbitmap(default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "netscan.ico"))
+    except Exception:
+        pass
     try:
         ttk.Style().theme_use("vista" if IS_WIN else "clam")
     except tk.TclError:
@@ -963,6 +976,7 @@ def main():
     nb.add(PortScanFrame(nb), text="Port Scan")
     nb.add(PingMonitorFrame(nb), text="Ping Monitor")
 
+    _center_window(root)
     root.mainloop()
 
 

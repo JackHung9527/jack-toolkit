@@ -9,6 +9,8 @@
 | [tools/serial/](tools/serial/) | 串列埠工具 | COM port HEX/ASCII 雙模式收發、連續傳送、內建程式設計師計算機 | tkinter |
 | [tools/netscan/](tools/netscan/) | 網路掃描器 | IP range ping sweep、port scan、ping monitor 含狀態統計 | tkinter |
 | [tools/ft232h/](tools/ft232h/) | FT232H 測試器 | FT232H USB 轉 GPIO/SPI/I2C 桌面測試介面 | tkinter |
+| [tools/calculator/](tools/calculator/) | 小算盤 | 仿 Windows 多模式計算機：標準 / 工程 / 程式(16,10,8,2 進位+位元運算) / 浮點數(IEEE 754) / CRC | tkinter |
+| [tools/netpriority/](tools/netpriority/) | 網路優先權 | 列出網路介面 IPv4 metric（優先權），可調整 / 一鍵降到最低 / 改回自動，套用走 UAC 提權 | tkinter |
 
 ## 目錄結構
 
@@ -17,8 +19,14 @@ jack-toolkit/
 ├── README.md                   # 本檔
 ├── .gitignore
 ├── requirements.txt            # 所有工具共用的依賴清單
-├── launcher.py                 # tkinter dashboard，掃 manifest 自動列出工具
-├── common/                     # 三支共用模組（純邏輯，不綁 GUI）
+├── launcher.py                 # tkinter dashboard，掃 manifest 自動列出工具（卡片顯示各工具圖示）
+├── launcher.ico                # launcher 視窗 / 釘選捷徑圖示
+├── iconkit.py                  # 零依賴向量圖示渲染引擎（PNG/ICO）
+├── make_icons.py               # 為 launcher 與每個工具產生 .ico + icon.png
+├── pin_launcher_to_taskbar.ps1 # 建立 launcher 捷徑並嘗試釘選工作列
+├── 建立桌面捷徑.bat            # 雙擊即在桌面建立 launcher 捷徑（自包含，產暫存 VBScript）
+├── fix_network_priority.bat    # CLI 版網路優先權修正（GUI 版見 tools/netpriority）
+├── common/                     # 共用模組（純邏輯，不綁 GUI）
 │   ├── __init__.py
 │   └── hex_utils.py            # HEX / ASCII / hex dump helper
 └── tools/
@@ -30,15 +38,32 @@ jack-toolkit/
     │   ├── network_scanner.py
     │   ├── manifest.json
     │   └── README.md
-    └── ft232h/                 # FT232H 測試器 (tkinter + pyftdi)
-        ├── main.py             # 入口（含 libusb backend fix）
+    ├── ft232h/                 # FT232H 測試器 (tkinter + pyftdi)
+    │   ├── main.py             # 入口（含 libusb backend fix）
+    │   ├── manifest.json
+    │   ├── README.md
+    │   ├── src/
+    │   │   ├── core/           # device / gpio / spi / i2c 控制
+    │   │   └── ui/             # 主視窗 + 三分頁 + log panel
+    │   └── tools/
+    │       └── install_driver.ps1  # 自動下 Zadig 換 driver
+    └── calculator/             # 小算盤 (tkinter，純標準函式庫，多模式)
+        ├── main.py             # 主視窗：模式導覽 + 鍵盤分派
+        ├── engine_decimal.py   # 標準引擎（Decimal 累加器）
+        ├── engine_sci.py       # 工程引擎（運算式求值）
+        ├── engine_prog.py      # 程式引擎（進位 / 位元運算 / 位寬）
+        ├── crc_defs.py         # CRC 模型與計算
+        ├── float_defs.py       # IEEE 754 解析
+        ├── theme.py            # 共用樣式
+        ├── ui_*.py             # 五個模式分頁 UI
+        ├── calculator.ico      # 視窗圖示
+        ├── icon.png            # launcher 卡片圖示
+        ├── 小算盤.bat          # 雙擊啟動器
         ├── manifest.json
-        ├── README.md
-        ├── src/
-        │   ├── core/           # device / gpio / spi / i2c 控制
-        │   └── ui/             # 主視窗 + 三分頁 + log panel
-        └── tools/
-            └── install_driver.ps1  # 自動下 Zadig 換 driver
+        └── README.md
+
+每個子工具目錄另含 `<tool>.ico`（視窗圖示）與 `icon.png`（launcher 卡片圖示），皆由根目錄
+`make_icons.py` 產生。
 ```
 
 ## 安裝依賴
@@ -59,7 +84,24 @@ python launcher.py
 
 或直接雙擊根目錄的 [launcher.bat](launcher.bat)（優先 `pythonw.exe` 跑，沒有黑色 console window）。
 
-launcher 視窗會列出所有工具卡片，點「啟動」即可在獨立 process 開啟對應工具，可重複啟動或同時開多個。右側「執行中」面板列出活著的子程序與 PID，按「終止」可關掉單一工具。
+launcher 視窗會列出所有工具卡片（每張卡片左側顯示該工具圖示），點「啟動」即可在獨立 process 開啟對應工具，可重複啟動或同時開多個。右側「執行中」面板列出活著的子程序與 PID，按「終止」可關掉單一工具。
+
+## 圖示與釘選工作列
+
+launcher 與每個子工具都有專屬圖示，全部由純標準函式庫產生（零第三方依賴）：
+
+```powershell
+python make_icons.py     # 重新產生 launcher.ico 與各工具的 .ico + icon.png
+```
+
+把 launcher 釘選到工作列：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File pin_launcher_to_taskbar.ps1
+```
+
+腳本會在桌面與開始功能表建立「jack-toolkit」捷徑（內嵌 launcher 圖示）並嘗試自動釘選。
+Windows 10/11 已移除「釘選到工作列」的程式化介面，若自動釘選失敗，腳本會開啟檔案總管並提示手動步驟：在捷徑上按右鍵 →（顯示更多選項 →）釘選到工作列。捷徑與 app 都刻意不寫顯式 AppUserModelID，點擊釘選捷徑啟動時 Windows 會把視窗併回同一顆按鈕，不會多出 pythonw 圖示。
 
 ## 各工具獨立執行
 
