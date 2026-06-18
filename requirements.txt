@@ -9,5 +9,8 @@ pyftdi>=0.55.4
 pyusb>=1.2.1
 libusb-package>=1.0.26.2
 
+# 校正設計工具 calib_designer（matplotlib 會一併帶入 numpy）
+matplotlib>=3.5
+
 # 打包工具（要產 .exe 時才需要，預設不裝）
 # pyinstaller>=6.0

@@ -92,6 +92,31 @@ python launcher.py --tool <name>
 
 ## 今日總結
 
+### 2026/06/18
+
+#### ✅ 完成項目
+- 從零做完新工具 `tools/calib_designer/`（**校正設計工具**，初版叫線性內插設計工具，後改名）：`main.py`/`app.py`/`engine.py`/`theme.py`/`manifest.json`/`make_icon.py`/`.bat`/`README.md`/`電流校正範例.csv`
+- 核心 `engine.py`（純 Python 可單測）：分段線性查表(LUT) 配點演算法 **貪婪(Douglas-Peucker)** 與 **DP minimax 最佳**、均勻分點、線性回歸(OLS, 可選子集擬合)、評估、三方比較、C/CSV 匯出產生器
+- 兩種模式（給點數找位置 / 給目標誤差找最少點數，相對量度時顯示「% 以內」）、兩種誤差量度（絕對 / 相對%）
+- UI：tk datagrid 輸入（雙擊編輯、節點欄）、嵌入式 matplotlib（裝進系統 Python 3.12）、中文字型 fallback、可捲動控制面板
+- C 匯出**完全對齊現場韌體 `linearInterpolationFromLUT`**（單組 `cal_<組名>_OV_X/TV_Y`、表內線性掃描、低於表頭由原點外插、高於表尾沿末段外插、負值箝位為 0）；另有線性回歸 `gain/offset` 匯出
+- 加「校正方式」(LUT / 線性回歸)、手動插點模式、演算法說明與標準公式彈窗、圖示（.ico + launcher 用 icon.png）
+- 圖表比較項目可多選疊圖（內插 演算法1/2、線性回歸、均勻、原始校正前），主方法鎖定顯示
+- 逐點比較數據表改三方（原始 / 內插 / 回歸 各點誤差 + 最佳欄，僅「最佳」欄上色）
+- 線性回歸取樣點數：預設=LUT 點數均勻撒點 + 滑桿調整 + 節點欄手動微調（不受 LUT 點數限制）
+- 工具改名 `interp_designer` → `calib_designer`（資料夾 / manifest name / .ico / .bat 用相同英文名 / 全引用同步）；requirements 加 `matplotlib>=3.5`
+
+#### 🐛 問題與踩坑
+- datagrid inline 編輯框是原生 `tk.Entry`，沒套小數點修正 → 數字鍵盤打不進小數點；補 `bind_numpad_decimal_fix`
+- C 浮點常數 bug：整數值節點用 `%g` 會產生 `0f`/`100f` 這種缺小數點的非法常數；格式化時強制補小數點
+- `_interp_on_nodes` 原本假設節點含頭尾，手動取消頭尾後範圍外的點被誤算成 0、誤差爆掉 → 改成逐點比照韌體外插（原點 / 末段 / 箝位），工具誤差才跟現場一致
+- 改名時 `mv` 資料夾遇到 "Device or resource busy"，根因是 Bash 持久 shell 的 cwd 卡在目標目錄內；先 `cd` 出去再 mv
+- 擷取自家 tkinter 視窗驗證 UI：FindWindow 比對中文標題不穩，改用 process MainWindowHandle / EnumWindows 挑「可見且面積最小」視窗 + PrintWindow(flag 2) 抓圖
+
+#### 📋 明日待辦
+- 實機驗證：雙擊 `calib_designer.bat`、launcher 卡片是否顯示 icon、numpad 小數點實打
+- 視需要把整包 `tools/calib_designer/` commit
+
 ### 2026/05/29
 
 #### ✅ 完成項目

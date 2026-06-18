@@ -11,6 +11,8 @@
 | [tools/ft232h/](tools/ft232h/) | FT232H 測試器 | FT232H USB 轉 GPIO/SPI/I2C 桌面測試介面 | tkinter |
 | [tools/calculator/](tools/calculator/) | 小算盤 | 仿 Windows 多模式計算機：標準 / 工程 / 程式(16,10,8,2 進位+位元運算) / 浮點數(IEEE 754) / CRC | tkinter |
 | [tools/netpriority/](tools/netpriority/) | 網路優先權 | 列出網路介面 IPv4 metric（優先權），可調整 / 一鍵降到最低 / 改回自動，套用走 UAC 提權 | tkinter |
+| [tools/circuit_calc/](tools/circuit_calc/) | 電路計算機 | 多模式電子電路計算（分壓、單位換算、電流量測放大器…），附參考電路圖、欄位可切單位 | tkinter |
+| [tools/calib_designer/](tools/calib_designer/) | 校正設計工具 | 校正(raw→target)設計/驗證：分段線性查表(LUT) 與 線性回歸並排比較、手動插點、逐點誤差比較，匯出比照韌體的 C 查表/gain-offset | tkinter + matplotlib |
 
 ## 目錄結構
 

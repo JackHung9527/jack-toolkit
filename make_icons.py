@@ -7,6 +7,7 @@
   ft232h    紫   / IC 晶片含接腳
   calculator藍   / 顯示區 + 按鈕格 + 橘色等號
   commbench 藍綠 / 開發板晶片 + 排針
+  circuit_calc 紅 / 電阻（含色環）接線
 
 用法：
     python make_icons.py
@@ -117,6 +118,21 @@ def glyph_commbench() -> list:
     return layers
 
 
+def glyph_circuit_calc() -> list:
+    # 電阻接線：兩端節點 + 導線 + IEC 電阻本體 + 三條色環（電阻色碼意象）
+    layers = []
+    y = 0.5
+    layers.append((ik.segment(0.14, y, 0.34, y, 0.028), WHITE))
+    layers.append((ik.segment(0.66, y, 0.86, y, 0.028), WHITE))
+    layers.append((ik.circle(0.14, y, 0.058), AMBER))
+    layers.append((ik.circle(0.86, y, 0.058), AMBER))
+    layers.append((ik.rrect(0.32, 0.385, 0.68, 0.615, 0.06), WHITE))
+    bands = [(0.41, ORANGE), (0.50, (43, 136, 255, 255)), (0.59, (70, 70, 80, 255))]
+    for bx, col in bands:
+        layers.append((ik.rect(bx - 0.020, 0.405, bx + 0.020, 0.595), col))
+    return layers
+
+
 def glyph_netpriority() -> list:
     # 遞減長條，代表優先序清單（上長下短）
     layers = []
@@ -144,6 +160,8 @@ DESIGNS = {
                    "bg": ((31, 208, 173), (12, 143, 120)),  "glyph": glyph_commbench},
     "netpriority": {"out": TOOLS / "netpriority" / "netpriority.ico", "png": TOOLS / "netpriority" / "icon.png",
                     "bg": ((255, 150, 60), (208, 92, 25)),  "glyph": glyph_netpriority},
+    "circuit_calc": {"out": TOOLS / "circuit_calc" / "circuit_calc.ico", "png": TOOLS / "circuit_calc" / "icon.png",
+                     "bg": ((230, 76, 72), (158, 30, 34)),  "glyph": glyph_circuit_calc},
 }
 
 

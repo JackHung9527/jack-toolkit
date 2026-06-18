@@ -4,6 +4,11 @@
 可調整指定介面的 metric、一鍵降到最低、或改回自動。讀取免權限；
 套用變更需要系統管理員權限，會跳 UAC 提權執行（變更可逆）。
 
+持久化：套用時除了用 Set-NetIPInterface 讓設定當下生效，也直接把
+InterfaceMetric 寫進該介面 GUID 的登錄檔機碼（Tcpip / Tcpip6），
+等同 Windows「網路內容→IPv4→進階→取消自動計量值」的做法，
+重開機後仍保留（純跑 Set-NetIPInterface 只進 ActiveStore，重開機會被沖掉）。
+
 對應原本的 fix_network_priority.bat 之 GUI 版。
 獨立執行：
     python main.py
@@ -43,6 +48,7 @@ sys.excepthook = _global_excepthook
 
 import ctypes
 import json
+import os
 import subprocess
 import threading
 import tkinter as tk
@@ -100,7 +106,8 @@ class NetPriorityApp:
         ttk.Label(head, text="網路介面優先權", font=("Segoe UI", 15, "bold")).pack(anchor="w")
         ttk.Label(head, foreground="#555",
                   text="優先權 = IPv4 interface metric，數字越小優先權越高。"
-                       "套用變更需要系統管理員權限（會跳 UAC）。").pack(anchor="w")
+                       "套用變更需要系統管理員權限（會跳 UAC），"
+                       "設定會寫入登錄檔，重開機後保留。").pack(anchor="w")
 
         # 表格
         table_box = ttk.Frame(self.root, padding=(12, 4))
@@ -251,7 +258,7 @@ class NetPriorityApp:
             messagebox.showwarning("優先權無效", "請輸入 1~9999 的整數")
             return
         self._do_set(row, _metric_script(row["idx"], metric, self.ipv6_var.get()),
-                     f"已將「{row['alias']}」優先權(metric)設為 {metric}")
+                     f"已將「{row['alias']}」優先權(metric)設為 {metric}（已寫入登錄檔，重開機後保留）")
 
     def _apply_lowest(self) -> None:
         row = self._selected_row()
@@ -261,14 +268,14 @@ class NetPriorityApp:
                                    f"將「{row['alias']}」的 metric 設為 9000（降到最低優先權）？"):
             return
         self._do_set(row, _metric_script(row["idx"], 9000, self.ipv6_var.get()),
-                     f"已將「{row['alias']}」降到最低優先權 (metric 9000)")
+                     f"已將「{row['alias']}」降到最低優先權 (metric 9000，重開機後保留)")
 
     def _apply_auto(self) -> None:
         row = self._selected_row()
         if row is None:
             return
         self._do_set(row, _auto_script(row["idx"], self.ipv6_var.get()),
-                     f"已將「{row['alias']}」改回自動 metric")
+                     f"已將「{row['alias']}」改回自動 metric（已移除登錄檔設定）")
 
     def _do_set(self, row: dict, inner: str, success_msg: str) -> None:
         if self._busy:
@@ -279,43 +286,99 @@ class NetPriorityApp:
         threading.Thread(target=self._set_worker, args=(inner, success_msg), daemon=True).start()
 
     def _set_worker(self, inner: str, success_msg: str) -> None:
+        # 提權子程序的詳細錯誤寫到這個 temp log（-Verb RunAs 不能用 -Redirect*，只能靠檔案傳回）
+        log = Path(os.environ.get("TEMP", os.environ.get("TMP", "."))) / "netpriority_apply.log"
+        try:
+            log.unlink()  # 先清掉，避免讀到上一輪的殘留
+        except OSError:
+            pass
+
         quoted = "'" + inner.replace("'", "''") + "'"
+        # -PassThru 取回提權子程序物件，再 exit 它的 ExitCode，否則 inner 失敗也會被當成成功
         outer = (
             "$ErrorActionPreference='Stop';"
-            "Start-Process powershell -Verb RunAs -Wait -ArgumentList "
-            "@('-NoProfile','-WindowStyle','Hidden','-Command'," + quoted + ")"
+            "$p=Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "
+            "@('-NoProfile','-WindowStyle','Hidden','-Command'," + quoted + ");"
+            "exit $p.ExitCode"
         )
         rc, _out, err = _run_ps(outer)
-        self.root.after(0, lambda: self._set_done(rc, err, success_msg))
+        detail = ""
+        if rc != 0:
+            try:
+                if log.exists():
+                    detail = log.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                pass
+        self.root.after(0, lambda: self._set_done(rc, err, detail, success_msg))
 
-    def _set_done(self, rc: int, err: str, success_msg: str) -> None:
+    def _set_done(self, rc: int, err: str, detail: str, success_msg: str) -> None:
         self._busy = False
         if rc == 0:
             self.status.set(success_msg)
             self.reload()
         else:
-            low = err.lower()
-            if "cancel" in low or "取消" in err or "by the user" in low:
+            low = (err + " " + detail).lower()
+            if "cancel" in low or "取消" in err or "取消" in detail or "by the user" in low:
                 self.status.set("已取消（未提權）")
             else:
-                self.status.set("套用失敗：" + (err.splitlines()[0] if err.strip() else "未知錯誤"))
+                msg = detail.strip() or err.strip() or "未知錯誤"
+                self.status.set("套用失敗：" + msg.splitlines()[0])
             self._set_action_state("normal")
 
 
+def _elevated_script(idx: int, body: str) -> str:
+    """組出在提權 powershell 內執行的腳本。
+
+    先由 ifIndex 解析出介面 GUID，算出 Tcpip / Tcpip6 兩個登錄檔機碼路徑（$reg4 / $reg6），
+    再執行傳入的 body（寫入或移除 InterfaceMetric），最後把成功/失敗用 exit code 回傳，
+    失敗時把 traceback 寫到 %TEMP%\\netpriority_apply.log 供 host 端顯示。
+    body 可使用 $idx / $reg4 / $reg6 三個變數。
+    """
+    return (
+        "$ErrorActionPreference='Stop';"
+        "$log=Join-Path $env:TEMP 'netpriority_apply.log';"
+        "try{"
+        f"$idx={idx};"
+        "$guid=(Get-NetAdapter -InterfaceIndex $idx -ErrorAction Stop).InterfaceGuid;"
+        "if([string]::IsNullOrEmpty($guid)){throw ('ifIndex '+$idx+' has no InterfaceGuid')};"
+        "$reg4='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\'+$guid;"
+        "$reg6='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\Interfaces\\'+$guid;"
+        + body +
+        "Remove-Item $log -Force -ErrorAction SilentlyContinue;"
+        "exit 0"
+        "}catch{"
+        "$_|Out-String|Set-Content -LiteralPath $log -Encoding UTF8;"
+        "exit 1"
+        "}"
+    )
+
+
 def _metric_script(idx: int, metric: int, ipv6: bool) -> str:
-    s = f"Set-NetIPInterface -InterfaceIndex {idx} -AddressFamily IPv4 -InterfaceMetric {metric}"
+    # 登錄檔寫入 = 持久（重開機保留）；Set-NetIPInterface = 當下立即生效（不必等重開機）
+    body = (
+        f"if(Test-Path $reg4){{Set-ItemProperty -LiteralPath $reg4 -Name InterfaceMetric -Type DWord -Value {metric}}};"
+        f"Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -InterfaceMetric {metric} -ErrorAction SilentlyContinue;"
+    )
     if ipv6:
-        s += (f"; Set-NetIPInterface -InterfaceIndex {idx} -AddressFamily IPv6 "
-              f"-InterfaceMetric {metric} -ErrorAction SilentlyContinue")
-    return s
+        body += (
+            f"if(Test-Path $reg6){{Set-ItemProperty -LiteralPath $reg6 -Name InterfaceMetric -Type DWord -Value {metric}}};"
+            f"Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -InterfaceMetric {metric} -ErrorAction SilentlyContinue;"
+        )
+    return _elevated_script(idx, body)
 
 
 def _auto_script(idx: int, ipv6: bool) -> str:
-    s = f"Set-NetIPInterface -InterfaceIndex {idx} -AddressFamily IPv4 -AutomaticMetric Enabled"
+    # 移除登錄檔值 = 重開機後恢復自動；Set-NetIPInterface -AutomaticMetric Enabled = 當下立即恢復自動
+    body = (
+        "if(Test-Path $reg4){Remove-ItemProperty -LiteralPath $reg4 -Name InterfaceMetric -ErrorAction SilentlyContinue};"
+        "Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv4 -AutomaticMetric Enabled -ErrorAction SilentlyContinue;"
+    )
     if ipv6:
-        s += (f"; Set-NetIPInterface -InterfaceIndex {idx} -AddressFamily IPv6 "
-              f"-AutomaticMetric Enabled -ErrorAction SilentlyContinue")
-    return s
+        body += (
+            "if(Test-Path $reg6){Remove-ItemProperty -LiteralPath $reg6 -Name InterfaceMetric -ErrorAction SilentlyContinue};"
+            "Set-NetIPInterface -InterfaceIndex $idx -AddressFamily IPv6 -AutomaticMetric Enabled -ErrorAction SilentlyContinue;"
+        )
+    return _elevated_script(idx, body)
 
 
 def _enable_dpi_awareness() -> None:

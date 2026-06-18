@@ -980,31 +980,33 @@ class SerialApp:
         for btn in (self.btn_send_hex, self.btn_send_ascii, self.btn_repeat_hex, self.btn_repeat_ascii):
             btn.state(state_send)
 
-    def _send_once(self, kind: str) -> None:
+    def _send_once(self, kind: str) -> bool:
+        """送出一筆。回傳是否成功；連續傳送靠此判斷出錯時要不要停。"""
         if self.ser is None or not self.ser.is_open:
             messagebox.showwarning("錯誤", "尚未連線")
-            return
+            return False
         text = self.hex_input_var.get() if kind == "hex" else self.ascii_input_var.get()
         try:
             if kind == "hex":
                 data = parse_hex(text)
                 if not data:
-                    return
+                    return True  # 空輸入：無資料可送，不視為錯誤
             else:
                 data = text.encode("latin-1", errors="replace") + self._ending_bytes()
         except ValueError as exc:
             messagebox.showwarning("HEX 格式錯誤", str(exc))
-            return
+            return False
         try:
             self.ser.write(data)
         except SerialException as exc:
             messagebox.showerror("發送失敗", str(exc))
             self._close_port()
-            return
+            return False
         self.tx_total += len(data)
         self.tx_count_var.set(f"發送: {self.tx_total} bytes")
         if self._repeat_kind is None:
             self._push_history(kind, text)
+        return True
 
     def _toggle_repeat(self, kind: str) -> None:
         if self._repeat_kind == kind:
@@ -1045,7 +1047,10 @@ class SerialApp:
         if self._repeat_kind is None:
             return
         kind = self._repeat_kind
-        self._send_once(kind)
+        if not self._send_once(kind):
+            # 連續傳送途中發生錯誤（格式錯誤 / 未連線 / 寫入失敗）：立即停止，不再排程
+            self._stop_repeat()
+            return
         if self._repeat_kind == kind:
             self._schedule_repeat()
 

@@ -1,0 +1,8 @@
+{
+  "name": "calib_designer",
+  "display_name": "校正設計工具",
+  "description": "校正(raw→target)設計/驗證：分段線性查表(LUT) 與 線性回歸 兩種校正方式並排比較；LUT 支援演算法自動配點(貪婪/DP)或手動插點、給點數或給目標%誤差；逐點比較數據表標出各點較佳方法；可匯出 C 查表陣列或 gain/offset、CSV、PNG",
+  "entry": "main.py",
+  "framework": "tkinter",
+  "requirements": "matplotlib>=3.5"
+}

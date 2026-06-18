@@ -1,0 +1,8 @@
+{
+  "name": "circuit_calc",
+  "display_name": "電路計算機",
+  "description": "電子電路計算工具：分壓電阻電壓、單位換算（Ω/mΩ/µΩ…）、OPA 放大器增益與輸出（含輸出再分壓）；所有數值皆可切換單位",
+  "entry": "main.py",
+  "framework": "tkinter",
+  "requirements": null
+}
