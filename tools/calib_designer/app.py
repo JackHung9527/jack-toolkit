@@ -812,8 +812,10 @@ class MainWindow:
                 self._set_node_column(engine.uniform_place(curve, k))
                 marked = self._marked_node_positions()
             reg, fit_m = engine.linear_regression(curve, metric, marked)
+            reg_fit = sorted(set(marked))                        # 回歸實際取用的點
         else:
             reg, fit_m = engine.linear_regression(curve, metric, None)
+            reg_fit = list(range(curve.n))                       # 全資料擬合
         reg_view = self._reg_view(reg, fit_m)
 
         sel_lut = algo2_view if sel == "dp" else algo1_view      # 選定演算法的 LUT 檢視
@@ -823,7 +825,7 @@ class MainWindow:
             "metric": metric, "kind": kind, "primary": primary, "lut": lut_view,
             "algo1": algo1_view, "algo2": algo2_view, "reg": reg_view,
             "uniform": uni_view, "raw": raw_view,
-            "algo_nodes": primary_algo_nodes, "reg_obj": reg,
+            "algo_nodes": primary_algo_nodes, "reg_obj": reg, "reg_fit": reg_fit,
         }
         self._draw()
         self._update_summary()
@@ -1028,7 +1030,9 @@ class MainWindow:
             messagebox.showinfo("無資料", "請先套用資料並計算。")
             return
         d = self._last
-        unit = "%" if d["metric"] == "rel" else ""
+        is_rel = d["metric"] == "rel"
+        unit = "%" if is_rel else ""
+        eps = engine._rel_scale(self.curve.ys) if is_rel else 0.0
         raw_v, lut_v, reg_v = d["raw"], d["lut"], d["reg"]
         rows = engine.three_way_table(self.curve, lut_v["yhat"], reg_v["yhat"])
         dec = self._auto_decimals(list(self.curve.xs) + list(self.curve.ys))
@@ -1036,7 +1040,7 @@ class MainWindow:
         top = tk.Toplevel(self.root)
         top.title("逐點比較：原始 / 線性內插 / 線性回歸")
         top.configure(bg=theme.BG)
-        top.geometry("780x600")
+        top.geometry("900x600")
 
         win = {"原始": 0, "內插": 0, "回歸": 0}
         for r in rows:
@@ -1066,9 +1070,11 @@ class MainWindow:
         cv.bind("<MouseWheel>", _wheel)
         grid.bind("<MouseWheel>", _wheel)
 
-        heads = ["#", "原始(MCU)", "目標", "原始誤差", "內插計算值", "內插誤差",
-                 "回歸計算值", "回歸誤差", "最佳"]
-        widths = [4, 11, 10, 10, 11, 10, 11, 10, 6]
+        esuf = "誤差%" if is_rel else "誤差"
+        heads = ["#", "原始(MCU)", "目標", f"原始{esuf}",
+                 "節點", "內插計算值", f"內插{esuf}",
+                 "取樣", "回歸計算值", f"回歸{esuf}", "最佳"]
+        widths = [4, 11, 10, 11, 5, 11, 11, 5, 11, 11, 6]
 
         def cell(rr, cc, text, bg="#ffffff", anchor="e", bold=False):
             tk.Label(grid, text=text, bg=bg, fg=theme.TEXT_PRIMARY,
@@ -1082,24 +1088,36 @@ class MainWindow:
         def fv(v):
             return f"{v:.{dec}f}"
 
-        def fe(e):
-            return f"{e:+.{dec}f}"
+        def fe(err, y):
+            # 相對量度顯示帶號 %，絕對量度顯示帶號絕對值
+            if is_rel:
+                return f"{err / max(abs(y), eps) * 100.0:+.2f}%"
+            return f"{err:+.{dec}f}"
 
+        lut_nodes = set(d["lut"]["nodes"]) if d["lut"] else set()
+        reg_fit = set(d.get("reg_fit", []))
         for i, r in enumerate(rows, start=1):
+            idx = r["load"] - 1                                  # 該列對應的樣本索引
+            is_node = idx in lut_nodes
+            is_fit = idx in reg_fit
             cell(i, 0, str(r["load"]), anchor="center")
             cell(i, 1, fv(r["x"]))
             cell(i, 2, fv(r["y"]))
-            cell(i, 3, fe(r["raw_err"]))
-            cell(i, 4, fv(r["lut_calc"]))
-            cell(i, 5, fe(r["lut_err"]))
-            cell(i, 6, fv(r["reg_calc"]))
-            cell(i, 7, fe(r["reg_err"]))
-            cell(i, 8, r["best"], bg=self._BEST_BG.get(r["best"], "#ffffff"),
+            cell(i, 3, fe(r["raw_err"], r["y"]))
+            cell(i, 4, "●" if is_node else "",
+                 bg=self._BEST_BG["內插"] if is_node else "#ffffff", anchor="center")
+            cell(i, 5, fv(r["lut_calc"]))
+            cell(i, 6, fe(r["lut_err"], r["y"]))
+            cell(i, 7, "●" if is_fit else "",
+                 bg=self._BEST_BG["回歸"] if is_fit else "#ffffff", anchor="center")
+            cell(i, 8, fv(r["reg_calc"]))
+            cell(i, 9, fe(r["reg_err"], r["y"]))
+            cell(i, 10, r["best"], bg=self._BEST_BG.get(r["best"], "#ffffff"),
                  anchor="center", bold=True)
 
         bar = tk.Frame(top, bg=theme.BG)
         bar.pack(fill="x", padx=10, pady=(0, 8))
-        tk.Label(bar, text="（誤差為帶號 目標-計算值；只有「最佳」欄上色：紅=原始 藍=內插 綠=回歸）",
+        tk.Label(bar, text="（節點●=內插LUT斷點，取樣●=回歸擬合用點；誤差帶號、相對量度時顯示%；最佳欄：紅=原始 藍=內插 綠=回歸）",
                  bg=theme.BG, fg=theme.TEXT_MUTED, font=(theme.UI, 8)).pack(side="left")
         theme.make_button(bar, "匯出 CSV", self._export_comparison_csv).pack(side="right")
         return top
