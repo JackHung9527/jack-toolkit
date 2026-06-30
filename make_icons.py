@@ -8,6 +8,7 @@
   calculator藍   / 顯示區 + 按鈕格 + 橘色等號
   commbench 藍綠 / 開發板晶片 + 排針
   circuit_calc 紅 / 電阻（含色環）接線
+  usbhid    桃紅 / USB 三叉戟
 
 用法：
     python make_icons.py
@@ -133,6 +134,24 @@ def glyph_circuit_calc() -> list:
     return layers
 
 
+def glyph_usbhid() -> list:
+    # USB 三叉戟意象：底部圓座 + 主幹，上分三路（中圓、左圓、右方塊）
+    layers = []
+    cx = 0.5
+    base_y = 0.80
+    top_y = 0.22
+    layers.append((ik.segment(cx, base_y, cx, top_y, 0.034), WHITE))   # 主幹
+    layers.append((ik.circle(cx, base_y, 0.072), AMBER))              # 底部圓座
+    layers.append((ik.circle(cx, top_y, 0.060), WHITE))              # 頂端圓頭
+    # 左分支末端圓
+    layers.append((ik.segment(cx, 0.50, 0.32, 0.40, 0.030), WHITE))
+    layers.append((ik.circle(0.32, 0.40, 0.058), WHITE))
+    # 右分支末端方塊
+    layers.append((ik.segment(cx, 0.42, 0.68, 0.34, 0.030), WHITE))
+    layers.append((ik.rect(0.62, 0.285, 0.74, 0.405), WHITE))
+    return layers
+
+
 def glyph_netpriority() -> list:
     # 遞減長條，代表優先序清單（上長下短）
     layers = []
@@ -162,6 +181,8 @@ DESIGNS = {
                     "bg": ((255, 150, 60), (208, 92, 25)),  "glyph": glyph_netpriority},
     "circuit_calc": {"out": TOOLS / "circuit_calc" / "circuit_calc.ico", "png": TOOLS / "circuit_calc" / "icon.png",
                      "bg": ((230, 76, 72), (158, 30, 34)),  "glyph": glyph_circuit_calc},
+    "usbhid":     {"out": TOOLS / "usbhid" / "usbhid.ico",  "png": TOOLS / "usbhid" / "icon.png",
+                   "bg": ((236, 72, 153), (146, 21, 91)),   "glyph": glyph_usbhid},
 }
 
 

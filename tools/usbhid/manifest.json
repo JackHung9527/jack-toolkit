@@ -1,0 +1,8 @@
+{
+  "name": "usbhid",
+  "display_name": "USB-HID 測試工具",
+  "description": "USB-HID host 終端機：列舉 HID 裝置、開啟指定 VID/PID collection、收 Input report、送 Output report、Get/Set Feature report，HEX/ASCII 雙模式 + 收發 log，適合測試自製 HID 裝置",
+  "entry": "main.py",
+  "framework": "tkinter",
+  "requirements": "hidapi>=0.14"
+}

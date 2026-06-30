@@ -92,6 +92,14 @@ python launcher.py --tool <name>
 
 ## 今日總結
 
+### 2026/06/30
+
+#### 診斷項目（無程式碼變更）
+- 排查使用者「乙太網路 metric 改 9000 隔天又變回預設」問題，確認與桌面 `回公司-claude.bat` / `外面-claude.bat` 無關——那兩個檔只切 proxy + 重啟 Tailscale + 寫 mode.txt，完全不碰 interface metric
+- 鎖定真因：出問題的是 **Realtek USB GbE**（idx17）。USB 網卡每次重新列舉（睡眠喚醒 / 重插 / 換孔）會鑄出**新的 interface GUID**，新 GUID 一律從 AutomaticMetric 開始 → 手動 9000 形同消失
+- 證據：登錄檔 `Tcpip\Parameters\Interfaces` 下同一張 USB 網卡有**兩個** GUID（`{74715fab}` 今天、`{abbd6e51}` 昨天）都掛 9000，且 Fast Startup 已關（HiberbootEnabled=0），排除快速啟動因素
+- 結論：`tools/netpriority/` 的「照 GUID 寫 InterfaceMetric」持久化策略對會 GUID churn 的 USB 網卡無解；治本要改「照網卡描述（InterfaceDescription 含 Realtek USB GbE）於登入 + NetworkProfile 連線事件重設」的排程工作。已提建議，使用者本次選擇暫不採用
+
 ### 2026/06/18
 
 #### ✅ 完成項目

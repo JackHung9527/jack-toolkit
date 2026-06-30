@@ -9,6 +9,9 @@ pyftdi>=0.55.4
 pyusb>=1.2.1
 libusb-package>=1.0.26.2
 
+# USB-HID Tester（Windows wheel 自帶 hidapi.dll，走 OS 內建 HID driver）
+hidapi>=0.14
+
 # 校正設計工具 calib_designer（matplotlib 會一併帶入 numpy）
 matplotlib>=3.5
 
