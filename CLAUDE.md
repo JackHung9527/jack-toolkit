@@ -92,6 +92,22 @@ python launcher.py --tool <name>
 
 ## 今日總結
 
+### 2026/07/08
+
+#### 完成項目
+- 編譯 + 燒錄 G071 CommBench 韌體，並產出一套「以後自己燒」的工具夾 `tools/CommBench/G071_NUCELO_CommBench/TOOLS/flash_via_stlink/`
+- 專案原本沒有 `Debug/`（從沒編譯過），用 STM32CubeIDE 1.16.0 headless `-import` + `-cleanBuild` 產生 Makefile 並編譯（0 errors 0 warnings，text=44408/data=92/bss=13764）
+- CommBench makefile 只產 .elf，照既有踩坑筆記由最新 .elf 強制 objcopy 重生 .hex/.bin（避開 stale-hex）
+- 燒錄明確指定 `sn=0667FF504857788667165423`（NUCLEO-G071RB）+ `--verify`，`Download verified successfully`，避免誤燒同時接著的 H7 板（SN `53FF74068678574858450267`）
+- 自助燒錄工具（stm32-stlink-flash skill 客製版）：雙擊 flash.bat 即燒，自動找 STM32_Programmer_CLI、自動挑 hex/ 內日期最新的 .hex、一律 program+verify、燒完 reset
+
+#### 問題與踩坑
+- 環境有兩顆 ST-Link，原 skill 模板遇多顆會直接 exit 7 罷工且不帶 `sn=`；客製成「用 Board Name 鎖定 NUCLEO-G071 並把 sn= 帶進每個 CLI 呼叫」，找不到目標就報錯停下，永不誤觸 H7
+- Write 工具產出無 BOM，含中文的 program.ps1 在 PowerShell 5.1 被 cp950 誤讀導致 parser 崩（missing terminator）；後處理轉 UTF-8 with BOM 解決（既有記憶 feedback_ps51_chinese_ps1_bom 已載）
+- config.ini 的 `[target]` 區段標頭一開始只寫在註解裡漏掉真正的 header，害 TARGET_BOARD 被歸到 [programmer] 區段；補上真正的 `[target]` 標頭
+- 加的 verify-only 旁支因 STM32_Programmer_CLI 的 `-v` 必須跟在 `-w` 後（不能單獨驗證）而報錯；直接移除該旁支，改成永遠 program+verify
+- headless import 動到 `.settings/language.settings.xml` 的 env-hash（IDE metadata 雜訊），已還原
+
 ### 2026/06/30
 
 #### 診斷項目（無程式碼變更）

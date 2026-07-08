@@ -1,0 +1,5 @@
+logs/*
+!logs/.gitkeep
+
+# 燒錄用韌體是本工具的交付物，覆寫 root .gitignore 的 *.hex 規則
+!hex/*.hex
