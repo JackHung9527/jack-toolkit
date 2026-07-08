@@ -139,6 +139,7 @@ class HidApp:
         self.tx_bytes = 0
         self._repeat_kind: Optional[str] = None
         self._repeat_after_id: Optional[str] = None
+        self._scanning = False
 
         root.title("USB-HID 測試工具")
         root.geometry("1180x760")
@@ -316,6 +317,8 @@ class HidApp:
                     textvariable=self.feat_len_var, width=7).pack(side="left", padx=(4, 8))
         self.btn_feat_get = ttk.Button(feat_top, text="Get Feature", command=self._get_feature)
         self.btn_feat_get.pack(side="right")
+        self.btn_feat_scan = ttk.Button(feat_top, text="掃描 ID", command=self._scan_report_ids)
+        self.btn_feat_scan.pack(side="right", padx=(0, 4))
 
         ttk.Label(feat_box, text="Set payload (HEX):").pack(anchor="w", pady=(6, 0))
         self.feat_hex_var = tk.StringVar()
@@ -425,13 +428,21 @@ class HidApp:
         self.reader = HidReader(dev, read_len, self.rx_queue)
         self.reader.start()
         self._set_connected(True)
+        self._set_status_connected()
+        self._log_text("INFO", f"開啟 {info.label}")
+
+    def _set_status_connected(self) -> None:
+        info = self._open_info
+        if info is None:
+            return
         self.status_var.set(
             f"已連線 {info.vid:04X}:{info.pid:04X}  "
             f"{info.product or '(無名稱)'}  UP {info.usage_page:04X}/{info.usage:02X}"
         )
-        self._log_text("INFO", f"開啟 {info.label}")
 
     def _close_device(self) -> None:
+        # 設 dev=None 前先把掃描旗標關掉，讓背景掃描 worker 於下一圈自行結束
+        self._scanning = False
         if self._repeat_kind is not None:
             self._stop_repeat()
         if self.reader is not None:
@@ -457,7 +468,8 @@ class HidApp:
         self.dev_combo.configure(state="disabled" if on else "readonly")
         send_state = ("!disabled",) if on else ("disabled",)
         for btn in (self.btn_send_hex, self.btn_send_ascii, self.btn_repeat_hex,
-                    self.btn_repeat_ascii, self.btn_feat_get, self.btn_feat_set):
+                    self.btn_repeat_ascii, self.btn_feat_get, self.btn_feat_set,
+                    self.btn_feat_scan):
             btn.state(send_state)
 
     # ---------------- 送出 ----------------
@@ -622,6 +634,72 @@ class HidApp:
             return
         self._log_bytes("FSET", buf)
         self._push_history("feat", text)
+
+    # ---------------- 掃描 Report ID ----------------
+
+    def _scan_report_ids(self) -> None:
+        """對 0x00~0xFF 逐一 Get Feature，找出有回應的 Report ID（唯讀、非破壞性）。
+
+        只掃 Feature GET：Output report 是「寫」進裝置、可能觸發實際動作（OTA / 繼電器
+        等），逐一亂送有風險，故不自動掃。實際 report 長度未知，Windows HidD_GetFeature
+        要求 buffer >= 該 report 宣告長度，太小會失敗（假陰性），因此掃描長度取
+        max(讀取長度, 64)；裝置 report 更長時請先把「讀取長度」調大再掃。
+        """
+        if self.dev is None:
+            messagebox.showwarning("錯誤", "尚未連線")
+            return
+        if self._scanning:
+            return
+        try:
+            length = max(1, int(self.feat_len_var.get()))
+        except (tk.TclError, ValueError):
+            length = DEFAULT_READ_LEN
+        length = max(length, 64)
+        dev = self.dev
+        self._scanning = True
+        self.btn_feat_scan.state(("disabled",))
+        self.status_var.set("掃描 Report ID 中… (Get Feature 0x00~0xFF)")
+        self._log_text("INFO", f"開始掃描 Feature Report ID 0x00~0xFF（讀取長度 {length}）")
+
+        def worker() -> None:
+            hits: list[tuple[int, bytes]] = []
+            for rid in range(0x100):
+                # 裝置被關閉 / 換裝置 / 使用者再按一次都會令 dev 變動或旗標翻掉，立即收手
+                if not self._scanning or self.dev is not dev:
+                    break
+                try:
+                    data = dev.get_feature_report(rid, length)
+                except (OSError, ValueError):
+                    data = None
+                if data:
+                    hits.append((rid, bytes(data)))
+            self.root.after(0, lambda: self._scan_done(hits))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _scan_done(self, hits: "list[tuple[int, bytes]]") -> None:
+        self._scanning = False
+        if self.dev is not None:
+            self.btn_feat_scan.state(("!disabled",))
+            self._set_status_connected()
+        if not hits:
+            self._log_text(
+                "INFO",
+                "掃描完成：0x00~0xFF 皆無回應（此裝置可能不支援 Feature report，"
+                "或報告長度需調大後再掃）",
+            )
+            return
+        self._log_text("INFO", f"掃描完成：{len(hits)} 個 Report ID 有回應")
+        for rid, data in hits:
+            self._log_text("FGET", f"ID 0x{rid:02X}  ({len(data)}B)  {bytes_to_hex(data)}")
+        ids = ", ".join(f"0x{rid:02X}" for rid, _ in hits)
+        self._log_text("INFO", f"可用 (Get Feature 有回應) Report ID：{ids}")
+        if len(hits) >= 200:
+            self._log_text(
+                "INFO",
+                "注意：幾乎所有 ID 都有回應，可能是裝置對任意 Feature 讀取都 ACK（偽陽性），"
+                "請人工核對各筆內容是否真的不同",
+            )
 
     # ---------------- 歷史命令 ----------------
 
@@ -874,7 +952,8 @@ class HidApp:
             "關於",
             "USB-HID 測試工具\ntkinter + hidapi\n\n"
             "列舉 HID 裝置、收 Input report、送 Output report、Get/Set Feature report，\n"
-            "HEX / ASCII 雙模式收發。適合測試自製 HID 裝置（含 vendor-defined usage page）。",
+            "HEX / ASCII 雙模式收發。適合測試自製 HID 裝置（含 vendor-defined usage page）。\n\n"
+            "「掃描 ID」：對 0x00~0xFF 逐一 Get Feature（唯讀），列出有回應的 Report ID。",
         )
 
     def _center(self, win) -> None:
