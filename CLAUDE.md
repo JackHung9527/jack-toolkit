@@ -92,6 +92,20 @@ python launcher.py --tool <name>
 
 ## 今日總結
 
+### 2026/07/14
+
+#### 完成項目
+- 把 `tools/calib_designer/`（校正設計工具）用 PyInstaller 單獨打包成 standalone `.exe`：`--onefile --windowed`、內嵌 `calib_designer.ico`，目標機免裝 Python / matplotlib，雙擊即開
+- 用有裝 matplotlib 3.11 + numpy 2.4 + PyInstaller 6.21 的系統 Python 3.12 打包；ico 一併 `--add-data` 進 bundle
+- 排除 venv 裡 matplotlib 自動拖入但工具沒用到的套件（scipy / pandas / lxml / openpyxl / Qt / wx），把 exe 從 79.7 MB 砍到 38.1 MB、建置時間也少一半
+- 實測啟動 + PrintWindow 依 HWND 截圖驗證：資料表格、校正方式、LUT 節點選法、matplotlib 比較圖與誤差子圖全渲染正常，中文標籤無豆腐方塊
+- 產物落在 `tools/calib_designer/dist/校正設計工具.exe`，已被既有 `.gitignore`（`dist/` `build/` `*.exe`）忽略，不進版控
+
+#### 問題與踩坑
+- venv Python 的 matplotlib PyInstaller hook 會自動探測並拖入 scipy / pandas / lxml / openpyxl / PIL 等「已安裝但工具沒 import」的套件，導致 onefile 肥大又拖慢啟動；工具實際只 import `csv / math / tkinter / matplotlib`，用 `--exclude-module` 砍掉這些屬零風險，直接砍半
+- onefile 模式下 `main.py` 的 `Path(__file__).resolve().parent` 指向 `_MEIPASS` 解壓暫存目錄；把 ico 用 `--add-data "calib_designer.ico;."` 放進 bundle 根，執行期 `iconbitmap` 就抓得到，視窗標題列圖示正常，不必改原始碼
+- onefile 會有 bootloader 父/子兩個同名 process，父 process 的 `MainWindowTitle` 為空；smoke test 要挑 `MainWindowHandle != 0` 的子 process 才抓得到視窗做截圖驗證
+
 ### 2026/07/08
 
 #### 完成項目
