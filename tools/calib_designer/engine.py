@@ -92,6 +92,27 @@ def _rel_scale(ys: list[float]) -> float:
     return max(1e-12, 1e-6 * peak)
 
 
+def is_excluded(y: float) -> bool:
+    """判斷該點是否應排除於配點與誤差評估之外。
+
+    目標值 y 恰為 0 的點：相對誤差以目標值為分母會除以近零、誤差無意義，
+    絕對誤差雖不會除零但使用者要求一律不將此點納入校正，故兩種量度都排除。
+    """
+    return y == 0.0
+
+
+def _filter_calc(curve: Curve) -> tuple[Curve, list[int]]:
+    """回傳「排除目標值為 0 後的計算用曲線」與「索引對照表」。
+
+    keep[k] 為精簡曲線第 k 點在原始 curve 中的索引；配點演算法一律跑在精簡曲線上，
+    回傳的節點索引再透過 keep 映射回原始 curve，確保目標值為 0 的點不會被選為節點。
+    """
+    keep = [i for i, y in enumerate(curve.ys) if not is_excluded(y)]
+    if len(keep) < 2:
+        raise ValueError("排除目標值為 0 的點後不足 2 點，無法配置查表節點。")
+    return Curve([curve.xs[i] for i in keep], [curve.ys[i] for i in keep]), keep
+
+
 def _interp_on_nodes(curve: Curve, nodes: list[int]) -> list[float]:
     """以節點折線在每個原始 x 上求值，完全對齊韌體 linearInterpolationFromLUT：
 
@@ -124,11 +145,28 @@ def _interp_on_nodes(curve: Curve, nodes: list[int]) -> list[float]:
 
 
 def _errors(curve: Curve, yhat: list[float], metric: str) -> list[float]:
+    """逐點誤差；目標值為 0 的點回傳 NaN 代表「不列入評估」。
+
+    NaN 在後續彙總（max/rms/最差點）一律以 not-a-number 過濾掉，
+    繪圖時 matplotlib 也會自動在該點斷線，避免相對誤差除以近零把圖炸掉。
+    """
     ys = curve.ys
+    nan = float("nan")
     if metric == "rel":
         eps = _rel_scale(ys)
-        return [abs(yh - y) / max(abs(y), eps) * 100.0 for y, yh in zip(ys, yhat)]
-    return [abs(yh - y) for y, yh in zip(ys, yhat)]
+        return [nan if is_excluded(y) else abs(yh - y) / max(abs(y), eps) * 100.0
+                for y, yh in zip(ys, yhat)]
+    return [nan if is_excluded(y) else abs(yh - y) for y, yh in zip(ys, yhat)]
+
+
+def _agg(errs: list[float]) -> tuple[float, float]:
+    """由逐點誤差算 (max, rms)，自動略過 NaN（目標值為 0 的排除點）。"""
+    valid = [e for e in errs if e == e]  # NaN != NaN，藉此濾掉排除點
+    if not valid:
+        return 0.0, 0.0
+    max_err = max(valid)
+    rms = math.sqrt(sum(e * e for e in valid) / len(valid))
+    return max_err, rms
 
 
 def evaluate(curve: Curve, nodes: list[int], metric: str) -> EvalResult:
@@ -136,8 +174,7 @@ def evaluate(curve: Curve, nodes: list[int], metric: str) -> EvalResult:
     nodes = sorted(nodes)
     yhat = _interp_on_nodes(curve, nodes)
     errs = _errors(curve, yhat, metric)
-    max_err = max(errs) if errs else 0.0
-    rms = math.sqrt(sum(e * e for e in errs) / len(errs)) if errs else 0.0
+    max_err, rms = _agg(errs)
     return EvalResult(nodes, yhat, errs, max_err, rms)
 
 
@@ -163,14 +200,17 @@ def linear_regression(curve: Curve, metric: str = "abs",
     無論用幾點擬合，誤差一律對「全部樣本」評估，這樣才能看出該直線在每一點的表現。
     OLS 最小化的是「絕對殘差平方和」；metric 只影響誤差「怎麼回報」（絕對 / 相對%）。
     """
-    if fit_indices is None or len(set(fit_indices)) < 2:
-        fx, fy = curve.xs, curve.ys
+    # 擬合資料一律排除目標值為 0 的點（與 LUT 配點一致，不納入校正）
+    included = [i for i in range(curve.n) if not is_excluded(curve.ys[i])]
+    if fit_indices is None:
+        idx = included
     else:
-        idx = sorted(set(i for i in fit_indices if 0 <= i < curve.n))
-        fx = [curve.xs[i] for i in idx]
-        fy = [curve.ys[i] for i in idx]
-        if len(fx) < 2:
-            fx, fy = curve.xs, curve.ys
+        idx = sorted(set(i for i in fit_indices
+                         if 0 <= i < curve.n and not is_excluded(curve.ys[i])))
+    if len(idx) < 2:
+        idx = included if len(included) >= 2 else list(range(curve.n))
+    fx = [curve.xs[i] for i in idx]
+    fy = [curve.ys[i] for i in idx]
     m = len(fx)
     sx = sum(fx)
     sy = sum(fy)
@@ -185,8 +225,7 @@ def linear_regression(curve: Curve, metric: str = "abs",
         b = (sy - a * sx) / m
     yhat = [a * x + b for x in curve.xs]  # 對全部樣本評估
     errs = _errors(curve, yhat, metric)
-    max_err = max(errs) if errs else 0.0
-    rms = math.sqrt(sum(e * e for e in errs) / len(errs)) if errs else 0.0
+    max_err, rms = _agg(errs)
     return RegResult(a, b, yhat, errs, max_err, rms), m
 
 
@@ -194,7 +233,14 @@ def linear_regression(curve: Curve, metric: str = "abs",
 
 def greedy_place(curve: Curve, n_nodes: int | None = None,
                  target_err: float | None = None, metric: str = "abs") -> list[int]:
-    """從頭尾兩點開始，反覆把節點插到誤差最大的樣本上。
+    """貪婪配點對外介面：先排除目標值為 0 的點，回傳原始曲線上的節點索引。"""
+    sub, keep = _filter_calc(curve)
+    return [keep[k] for k in _greedy_impl(sub, n_nodes, target_err, metric)]
+
+
+def _greedy_impl(curve: Curve, n_nodes: int | None = None,
+                 target_err: float | None = None, metric: str = "abs") -> list[int]:
+    """從頭尾兩點開始，反覆把節點插到誤差最大的樣本上（假設 curve 已排除排除點）。
 
     n_nodes 與 target_err 至少給一個：
       - 給 n_nodes：插到節點數達到 n_nodes 為止。
@@ -307,6 +353,12 @@ def _dp_from_cost(cost: list[list[float]], n_nodes: int, n: int) -> list[int]:
 
 
 def dp_optimal(curve: Curve, n_nodes: int, metric: str = "abs") -> list[int]:
+    """DP 最佳配點對外介面：先排除目標值為 0 的點，回傳原始曲線上的節點索引。"""
+    sub, keep = _filter_calc(curve)
+    return [keep[k] for k in _dp_optimal_impl(sub, n_nodes, metric)]
+
+
+def _dp_optimal_impl(curve: Curve, n_nodes: int, metric: str = "abs") -> list[int]:
     """對給定節點數求 minimax 最佳配置（節點限制落在樣本點上，故為精確最佳）。"""
     n = curve.n
     if n_nodes >= n:
@@ -318,6 +370,12 @@ def dp_optimal(curve: Curve, n_nodes: int, metric: str = "abs") -> list[int]:
 # === 均勻分點（對照基準） ===
 
 def uniform_place(curve: Curve, n_nodes: int) -> list[int]:
+    """均勻配點對外介面：先排除目標值為 0 的點，回傳原始曲線上的節點索引。"""
+    sub, keep = _filter_calc(curve)
+    return [keep[k] for k in _uniform_impl(sub, n_nodes)]
+
+
+def _uniform_impl(curve: Curve, n_nodes: int) -> list[int]:
     """沿 x 等距取最近樣本當節點（手動均分的代表）。頭尾固定。"""
     n = curve.n
     k = min(max(n_nodes, 2), n)
@@ -340,6 +398,13 @@ def uniform_place(curve: Curve, n_nodes: int) -> list[int]:
 
 def min_nodes_for_target(curve: Curve, target_err: float,
                          metric: str = "abs", method: str = "greedy") -> list[int]:
+    """求最少節點對外介面：先排除目標值為 0 的點，回傳原始曲線上的節點索引。"""
+    sub, keep = _filter_calc(curve)
+    return [keep[k] for k in _min_nodes_impl(sub, target_err, metric, method)]
+
+
+def _min_nodes_impl(curve: Curve, target_err: float,
+                    metric: str = "abs", method: str = "greedy") -> list[int]:
     """回傳使最大誤差 <= target_err 的（近似）最少節點配置。
 
     method == "greedy"：直接貪婪細分到達標。
@@ -348,7 +413,7 @@ def min_nodes_for_target(curve: Curve, target_err: float,
     """
     n = curve.n
     if method == "greedy":
-        return greedy_place(curve, target_err=target_err, metric=metric)
+        return _greedy_impl(curve, target_err=target_err, metric=metric)
 
     cost = _build_cost(curve, metric)
     lo, hi = 2, n
@@ -542,41 +607,52 @@ def export_c_regression(reg: RegResult, metric: str, group_name: str = "lut") ->
     return "\n".join(out)
 
 
-def three_way_table(curve: Curve, lut_yhat: list[float], reg_yhat: list[float]) -> list[dict]:
-    """逐點比較 原始 / 線性內插 / 線性回歸 三者，標出該點表現最好者。
+def comparison_table(curve: Curve, lut_yhat: list[float], uni_yhat: list[float],
+                     reg_yhat: list[float]) -> list[dict]:
+    """逐點比較 原始 / 內插(演算法配點) / 內插(均勻撒點) / 線性回歸，標出表現最好者。
 
-    每列 dict：load, x, y, raw_err, lut_calc, lut_err, reg_calc, reg_err, best
+    每列 dict：load, x, y, raw_err, lut_calc/err, uni_calc/err, reg_calc/err, best, excluded
       - raw_err = y - x（校正前）
-      - lut_err = y - lut_calc，reg_err = y - reg_calc（皆帶正負號）
-      - best ∈ {"原始", "內插", "回歸"}：|誤差| 最小者（平手依 內插 > 回歸 > 原始 優先）
+      - *_err = y - *_calc（皆帶正負號）
+      - best ∈ {"原始", "內插", "均勻", "回歸"}：|誤差| 最小者
+        （平手依 內插 > 均勻 > 回歸 > 原始 優先；目標值為 0 的排除點 best = "—"）
     """
     rows = []
     for i in range(curve.n):
         x, y = curve.xs[i], curve.ys[i]
+        excluded = is_excluded(y)
         re = y - x
         le = y - lut_yhat[i]
+        ue = y - uni_yhat[i]
         ge = y - reg_yhat[i]
-        # 平手優先序：內插、回歸、原始
-        cand = [("內插", abs(le)), ("回歸", abs(ge)), ("原始", abs(re))]
-        best = min(cand, key=lambda t: t[1])[0]
+        if excluded:
+            best = "—"                               # 目標值為 0：不參與最佳排名
+        else:
+            # 平手優先序：內插、均勻、回歸、原始
+            cand = [("內插", abs(le)), ("均勻", abs(ue)), ("回歸", abs(ge)), ("原始", abs(re))]
+            best = min(cand, key=lambda t: t[1])[0]
         rows.append({"load": i + 1, "x": x, "y": y, "raw_err": re,
                      "lut_calc": lut_yhat[i], "lut_err": le,
-                     "reg_calc": reg_yhat[i], "reg_err": ge, "best": best})
+                     "uni_calc": uni_yhat[i], "uni_err": ue,
+                     "reg_calc": reg_yhat[i], "reg_err": ge,
+                     "best": best, "excluded": excluded})
     return rows
 
 
-def export_three_way_csv_rows(curve: Curve, lut_yhat: list[float],
-                              reg_yhat: list[float]) -> list[list[str]]:
-    """三方逐點比較的 CSV 內容（全精度）。"""
+def export_comparison_csv_rows(curve: Curve, lut_yhat: list[float], uni_yhat: list[float],
+                               reg_yhat: list[float]) -> list[list[str]]:
+    """四方逐點比較的 CSV 內容（全精度）。"""
     def num(v: float) -> str:
         return f"{v:.9g}"
 
     header = ["load", "raw_original", "target", "raw_err",
-              "lut_calc", "lut_err", "reg_calc", "reg_err", "best"]
+              "lut_calc", "lut_err", "uni_calc", "uni_err",
+              "reg_calc", "reg_err", "best"]
     out = [header]
-    for r in three_way_table(curve, lut_yhat, reg_yhat):
+    for r in comparison_table(curve, lut_yhat, uni_yhat, reg_yhat):
         out.append([str(r["load"]), num(r["x"]), num(r["y"]), num(r["raw_err"]),
                     num(r["lut_calc"]), num(r["lut_err"]),
+                    num(r["uni_calc"]), num(r["uni_err"]),
                     num(r["reg_calc"]), num(r["reg_err"]), r["best"]])
     return out
 
@@ -600,6 +676,8 @@ def export_csv_rows(curve: Curve, nodes: list[int], metric: str) -> list[list[st
             dx = xb - xa
             worst = 0.0
             for k in range(a + 1, b):
+                if is_excluded(curve.ys[k]):
+                    continue                         # 目標值為 0 的點不列入誤差
                 t = 0.0 if dx == 0.0 else (curve.xs[k] - xa) / dx
                 yh = ya + t * (yb - ya)
                 if use_rel:

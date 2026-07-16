@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 S = 4  # 超取樣倍率，畫大張再縮小以求邊緣平滑
 BASE = 256
@@ -24,6 +24,17 @@ CURVE = (174, 184, 194, 255)     # 原始曲線灰
 AXIS = (200, 206, 214, 255)
 CARD = (255, 255, 255, 255)
 WHITE = (255, 255, 255, 255)
+RED = (214, 40, 40, 255)         # 版本標記 V2 紅
+
+
+def _load_bold_font(size: int) -> ImageFont.FreeTypeFont:
+    """載入粗體 TrueType 字型畫 "V2"；找不到常見字型時退回預設點陣字。"""
+    for name in ("arialbd.ttf", "ariblk.ttf", "segoeuib.ttf", "arial.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 # 繪圖區（base 座標）
 PX0, PX1 = 60, 214
@@ -69,6 +80,13 @@ def main() -> None:
     for cx, cy in poly:
         d.ellipse([cx - r_out, cy - r_out, cx + r_out, cy + r_out], fill=ACCENT)
         d.ellipse([cx - r_in, cy - r_in, cx + r_in, cy + r_in], fill=WHITE)
+
+    # 右下角紅色 "V2" 版本標記（白色描邊，在卡片與折線上都清楚可讀）
+    font = _load_bold_font(70 * S)
+    stroke = 4 * S
+    br = 224 * S                                     # 文字右下角錨點（留在圓角卡片內）
+    d.text((br, br), "V2", font=font, fill=RED, anchor="rd",
+           stroke_width=stroke, stroke_fill=WHITE)
 
     here = Path(__file__).resolve().parent
 

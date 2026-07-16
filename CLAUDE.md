@@ -92,6 +92,23 @@ python launcher.py --tool <name>
 
 ## 今日總結
 
+### 2026/07/16
+
+#### 完成項目
+- 校正設計工具（`tools/calib_designer/`）新增「目標值為 0 的點一律排除」：相對誤差以目標值為分母，y=0 會除以近零把誤差炸掉。做法是 engine 新增 `is_excluded()` + `_filter_calc()`，所有配點演算法（greedy / dp / uniform / min_nodes）改成 wrapper——先濾掉 y=0 的點再配點、回傳的節點索引再映射回原始曲線，確保 y=0 永不被選為節點；頭尾自動改用第一個/最後一個非零點
+- 誤差評估對 y=0 的點回傳 NaN（`_errors`），彙總用 `_agg()` 過濾 NaN 算 max/RMS，繪圖時 matplotlib 自動在該點斷線；手動插點與回歸取樣點都擋掉 y=0 的列；線性回歸擬合也排除 y=0
+- 逐點比較數據表可右鍵複製整表（或按「複製到剪貼簿」鈕）：整表以 Tab 分欄、換行分列丟進剪貼簿，貼到 xlsx 自動落格
+- 回歸取樣點數改為鎖定＝LUT 節點數（移除原本可自由拖的滑桿），只保留「同內插節點 / 均勻同點數」兩種撒點方式的單選；節點欄改顯示回歸實際取用的點
+- 逐點比較表由三方擴成四方：原始 / 內插(演算法) / 內插(均勻) / 線性回歸，新增「均點」標記與「均勻計算值 / 均勻誤差」欄、四方最佳評比，並加水平捲軸容納變寬欄位
+- 重新設計圖示：`make_icon.py` 在卡片右下角加紅色 "V2"（白色描邊，48px 小圖仍可辨識）；UI 視窗標題改「校正設計工具 V2」
+- 用系統 Python 3.12（PyInstaller 6.21 / matplotlib 3.11 / numpy 2.4）重新打包 `dist/校正設計工具.exe`（38.2 MB），實機啟動確認標題列「校正設計工具 V2」+ UI 全渲染正常
+
+#### 問題與踩坑
+- **PyInstaller 不能排除 PIL**：matplotlib 3.11 的 `colors.py` 在 import 期就 `from PIL import Image`（非 try/except），所以 `--exclude-module PIL` 會讓 matplotlib 整包 import 失敗、frozen exe 一啟動就崩潰。第一次打包貪圖省 6 MB 加了 `--exclude-module PIL`（32.1 MB），結果 exe 崩潰。移除該排除、改回原本排除清單（scipy/pandas/lxml/openpyxl/Qt/wx）才恢復正常（38.2 MB）。工具本身雖沒 import PIL，但 matplotlib 硬相依，不可砍
+- onefile 模式下 `main.py` 的 `calib_designer_error.log` 因 `Path(__file__).parent` 指向 `_MEIPASS` 暫存解壓區，崩潰後隨程序結束刪除，所以「看不到 error log」不代表沒崩潰；改用「process 是否存活 + PrintWindow 依 HWND 截圖」判斷 exe 生死
+- 相對誤差用 `max(abs(y), eps)` 只是避免除零，但 y=0 時仍會回傳巨大誤差主導 minimax、逼演算法把節點浪費在零點；改用 NaN sentinel 徹底排除才對
+- 逐點比較表是 `tk.Label` 一格格 grid（為了只給「最佳」欄上色），無原生選取；右鍵複製改用「建整表 TSV → 塞剪貼簿」，並在每個 cell 綁 `<Button-3>` 才能任一格叫出選單
+
 ### 2026/07/14
 
 #### 完成項目

@@ -73,7 +73,7 @@ class MainWindow:
         self._recompute_job: str | None = None
         self._last: dict | None = None  # 最近一次結果，供匯出使用
 
-        root.title("校正設計工具")
+        root.title("校正設計工具 V2")
         root.configure(bg=theme.BG)
         root.geometry("1180x850")
         root.minsize(980, 680)
@@ -86,7 +86,10 @@ class MainWindow:
         self.manual_mode = tk.BooleanVar(value=False)     # 手動插點模式
         self.n_var = tk.IntVar(value=6)
         self.target_var = tk.StringVar(value="1.0")
-        self.reg_n_var = tk.IntVar(value=6)               # 回歸取樣點數
+        # 回歸取樣方式：點數一律鎖定＝LUT 節點數，只能選撒點位置
+        #   same    → 用與內插法完全相同的節點位置
+        #   uniform → 相同點數、沿 x 均勻撒點
+        self.reg_place = tk.StringVar(value="same")
         self.group_var = tk.StringVar(value="lut")        # C 匯出的組名
         self._algo_count = 2                              # 手動模式的節點數上限
         # 圖表比較項目（可同時疊多條）
@@ -185,14 +188,16 @@ class MainWindow:
         self.kind_hint = tk.Label(g_kind, text="", bg=theme.BG, fg=theme.TEXT_MUTED,
                                   font=(theme.UI, 8), justify="left")
         self.kind_hint.pack(anchor="w", pady=(2, 0))
-        # 回歸取樣點數滑桿（只在回歸模式顯示）
-        self.reg_n_row = tk.Frame(g_kind, bg=theme.BG)
-        tk.Label(self.reg_n_row, text="回歸取樣點數", bg=theme.BG, fg=theme.TEXT_SECONDARY,
+        # 回歸取樣方式：點數一律＝LUT 節點數，只能選撒點位置（同內插節點 / 均勻同點數）
+        self.reg_place_row = tk.Frame(g_kind, bg=theme.BG)
+        tk.Label(self.reg_place_row, text="回歸取樣", bg=theme.BG, fg=theme.TEXT_SECONDARY,
                  font=(theme.UI, 10)).pack(side="left")
-        self.reg_n_scale = tk.Scale(self.reg_n_row, from_=2, to=20, orient="horizontal",
-                                    variable=self.reg_n_var, bg=theme.BG, troughcolor=theme.PANEL,
-                                    highlightthickness=0, length=140, command=self._on_reg_n_change)
-        self.reg_n_scale.pack(side="left", padx=(6, 0))
+        for txt, val in (("同內插節點", "same"), ("均勻同點數", "uniform")):
+            tk.Radiobutton(self.reg_place_row, text=txt, variable=self.reg_place, value=val,
+                           bg=theme.BG, fg=theme.TEXT_PRIMARY, activebackground=theme.BG,
+                           selectcolor=theme.GROUP_BG, font=(theme.UI, 9),
+                           command=self._on_reg_place_change).pack(side="left", padx=(6, 0))
+        self.reg_place_row.pack(fill="x", pady=(2, 0))
 
         # --- 模式（LUT 節點數）---
         g_mode = theme.group(panel, "LUT 節點選法")
@@ -384,12 +389,11 @@ class MainWindow:
             self._set_summary(str(e))
             return
         self.curve = curve
-        self.n_scale.configure(to=max(2, curve.n))
-        self.reg_n_scale.configure(to=max(2, curve.n))
-        if self.n_var.get() > curve.n:
-            self.n_var.set(curve.n)
-        if self.reg_n_var.get() > curve.n:
-            self.reg_n_var.set(curve.n)
+        # 節點數上限以「排除目標值為 0 後的可用點數」為準（回歸點數一律跟隨此節點數）
+        usable = max(2, sum(1 for y in curve.ys if not engine.is_excluded(y)))
+        self.n_scale.configure(to=usable)
+        if self.n_var.get() > usable:
+            self.n_var.set(usable)
         self._recompute()
 
     # --- datagrid 互動 ---
@@ -597,7 +601,7 @@ class MainWindow:
 
     def _update_kind_hint(self) -> None:
         if self.method_kind.get() == "reg":
-            self.kind_hint.configure(text="點「節點」欄選回歸要用的點（預設全選，可不等於 LUT 點數）")
+            self.kind_hint.configure(text="回歸點數＝LUT 節點數；「節點」欄顯示回歸實際取用的點")
         else:
             self.kind_hint.configure(text="「節點」欄顯示 LUT 斷點；手動模式可自己點選")
 
@@ -622,15 +626,9 @@ class MainWindow:
         is_reg = self.method_kind.get() == "reg"
         self.manual_chk.configure(state="disabled" if is_reg else "normal")
         self._sync_overlay_locks()
-        if is_reg:
-            self.reg_n_row.pack(fill="x", pady=(2, 0))           # 顯示回歸取樣滑桿
-            if self.curve is not None:
-                self.reg_n_var.set(max(2, min(self._algo_count, self.curve.n)))
-                self._set_node_column(engine.uniform_place(self.curve, self.reg_n_var.get()))
-        else:
-            self.reg_n_row.pack_forget()                         # 隱藏回歸取樣滑桿
-            if self.manual_mode.get() and self._last and self._last.get("algo_nodes"):
-                self._set_node_column(self._last["algo_nodes"])
+        # 回歸模式不用手動插點；切回 LUT 手動模式時把節點欄還原成演算法起點
+        if not is_reg and self.manual_mode.get() and self._last and self._last.get("algo_nodes"):
+            self._set_node_column(self._last["algo_nodes"])
         self._recompute()
 
     def _on_algo_change(self) -> None:
@@ -643,10 +641,8 @@ class MainWindow:
             self._set_node_column(self._last["algo_nodes"])      # 手動起點 = 演算法
         self._recompute()
 
-    def _on_reg_n_change(self, _v=None) -> None:
-        if self.method_kind.get() == "reg" and self.curve is not None:
-            k = max(2, min(int(self.reg_n_var.get()), self.curve.n))
-            self._set_node_column(engine.uniform_place(self.curve, k))  # 均勻撒點
+    def _on_reg_place_change(self) -> None:
+        # 撒點方式改變：節點欄與計算會在 _recompute 依新方式重畫
         self._schedule_recompute()
 
     def _marked_node_positions(self) -> list[int]:
@@ -661,7 +657,11 @@ class MainWindow:
 
     def _manual_nodes(self) -> list[int]:
         # 頭尾不強制：韌體查表支援表外外插（低於表頭由原點、高於表尾沿末段），可自由取消頭尾
-        return sorted(set(self._marked_node_positions()))
+        marks = self._marked_node_positions()
+        if self.curve is not None:                   # 防呆：目標值為 0 的點不得為節點
+            marks = [i for i in marks
+                     if i < self.curve.n and not engine.is_excluded(self.curve.ys[i])]
+        return sorted(set(marks))
 
     def _on_tree_click(self, event: tk.Event):
         if self.tree.identify("region", event.x, event.y) != "cell":
@@ -671,16 +671,20 @@ class MainWindow:
         iid = self.tree.identify_row(event.y)
         if not iid:
             return None
-        kind = self.method_kind.get()
-        if kind == "reg":
-            self._toggle_reg_point(iid)
-            return "break"
-        if kind == "lut" and self.manual_mode.get():
+        # 只有 LUT 手動插點模式可用節點欄挑點；回歸點數已鎖定＝LUT 節點數，不手動挑
+        if self.method_kind.get() == "lut" and self.manual_mode.get():
             self._toggle_manual_node(iid)
             return "break"
         return None
 
     def _toggle_manual_node(self, iid: str) -> None:
+        # 目標值為 0 的點不可設為節點（相對誤差分母為目標值，且不納入校正）
+        try:
+            if engine.is_excluded(float(self.tree.set(iid, "y"))):
+                self.root.bell()
+                return
+        except ValueError:
+            pass
         rows = self.tree.get_children()
         n_now = sum(1 for r in rows if self.tree.set(r, "node") == "●")
         if self.tree.set(iid, "node") == "●":
@@ -692,18 +696,6 @@ class MainWindow:
             if n_now >= self._algo_count:
                 self.root.bell()                                 # 已達演算法點數上限
                 return
-            self.tree.set(iid, "node", "●")
-        self._schedule_recompute()
-
-    def _toggle_reg_point(self, iid: str) -> None:
-        rows = self.tree.get_children()
-        if self.tree.set(iid, "node") == "●":
-            n_now = sum(1 for r in rows if self.tree.set(r, "node") == "●")
-            if n_now <= 2:
-                self.root.bell()                                 # 至少留 2 點才能擬合
-                return
-            self.tree.set(iid, "node", "")
-        else:
             self.tree.set(iid, "node", "●")
         self._schedule_recompute()
 
@@ -742,8 +734,9 @@ class MainWindow:
         """原始（校正前）：計算值 = 原始讀值 x，誤差 = y - x。"""
         yhat = list(curve.xs)
         errs = engine._errors(curve, yhat, metric)
-        mx = max(errs) if errs else 0.0
-        rms = (sum(e * e for e in errs) / len(errs)) ** 0.5 if errs else 0.0
+        valid = [e for e in errs if e == e]          # 濾掉 NaN（目標值為 0 的排除點）
+        mx = max(valid) if valid else 0.0
+        rms = (sum(e * e for e in valid) / len(valid)) ** 0.5 if valid else 0.0
         return {"kind": "raw", "ckey": "raw", "label": "原始", "yhat": yhat, "errors": errs,
                 "max": mx, "rms": rms, "node_count": 0, "nodes": None,
                 "a": None, "b": None, "desc": "校正前"}
@@ -795,31 +788,35 @@ class MainWindow:
                                   engine.uniform_place(curve, len(primary_algo_nodes)), "均勻", "uniform")
         raw_view = self._raw_view(curve, metric)
 
-        # LUT 主方法：手動 or 選定演算法
+        # LUT 主方法：手動 or 選定演算法（先決定 lut_view，回歸取樣要跟隨它的節點）
         manual_view = None
+        if kind == "lut" and self.manual_mode.get() and not self._marked_node_positions():
+            self._set_node_column(primary_algo_nodes)            # 手動起點 = 演算法
         if kind == "lut" and self.manual_mode.get():
-            if not self._marked_node_positions():
-                self._set_node_column(primary_algo_nodes)        # 手動起點 = 演算法
             manual_view = self._lut_view(curve, metric, self._manual_nodes(), "手動", "manual")
-        elif kind == "lut":
-            self._set_node_column(primary_algo_nodes)            # 顯示演算法選的節點
-
-        # 線性回歸（reg 模式用節點欄選的擬合點；否則全資料擬合，供疊圖/比較）
-        if kind == "reg":
-            marked = self._marked_node_positions()
-            if not marked:
-                k = max(2, min(self.reg_n_var.get(), curve.n))
-                self._set_node_column(engine.uniform_place(curve, k))
-                marked = self._marked_node_positions()
-            reg, fit_m = engine.linear_regression(curve, metric, marked)
-            reg_fit = sorted(set(marked))                        # 回歸實際取用的點
-        else:
-            reg, fit_m = engine.linear_regression(curve, metric, None)
-            reg_fit = list(range(curve.n))                       # 全資料擬合
-        reg_view = self._reg_view(reg, fit_m)
 
         sel_lut = algo2_view if sel == "dp" else algo1_view      # 選定演算法的 LUT 檢視
         lut_view = manual_view if manual_view is not None else sel_lut
+        lut_nodes = lut_view["nodes"]                            # 目前實際採用的 LUT 節點
+
+        # 線性回歸：點數一律＝LUT 節點數，撒點位置依「回歸取樣」設定
+        #   same    → 用與 LUT 完全相同的節點位置
+        #   uniform → 相同點數、沿 x 均勻撒點
+        if self.reg_place.get() == "uniform":
+            reg_fit = engine.uniform_place(curve, len(lut_nodes))
+        else:
+            reg_fit = list(lut_nodes)
+        reg_fit = [i for i in sorted(set(reg_fit)) if not engine.is_excluded(curve.ys[i])]
+        reg, fit_m = engine.linear_regression(curve, metric, reg_fit)
+        reg_view = self._reg_view(reg, fit_m)
+
+        # 節點欄顯示：LUT 模式顯示 LUT 節點；回歸模式顯示回歸實際取用的點
+        if kind == "reg":
+            self._set_node_column(reg_fit)
+        elif not self.manual_mode.get():
+            self._set_node_column(lut_nodes)
+        # LUT 手動模式：節點欄即使用者手選，維持不動
+
         primary = reg_view if kind == "reg" else lut_view
         self._last = {
             "metric": metric, "kind": kind, "primary": primary, "lut": lut_view,
@@ -1023,7 +1020,7 @@ class MainWindow:
         dec = 4 - int(math.floor(math.log10(peak)))
         return max(0, min(6, dec))
 
-    _BEST_BG = {"原始": "#f6dcdc", "內插": "#dce8f6", "回歸": "#d8f0e0"}
+    _BEST_BG = {"原始": "#f6dcdc", "內插": "#dce8f6", "均勻": "#f6e6c8", "回歸": "#d8f0e0"}
 
     def _show_data_table(self) -> None:
         if self._last is None or self.curve is None:
@@ -1033,57 +1030,92 @@ class MainWindow:
         is_rel = d["metric"] == "rel"
         unit = "%" if is_rel else ""
         eps = engine._rel_scale(self.curve.ys) if is_rel else 0.0
-        raw_v, lut_v, reg_v = d["raw"], d["lut"], d["reg"]
-        rows = engine.three_way_table(self.curve, lut_v["yhat"], reg_v["yhat"])
+        raw_v, lut_v, uni_v, reg_v = d["raw"], d["lut"], d["uniform"], d["reg"]
+        rows = engine.comparison_table(self.curve, lut_v["yhat"], uni_v["yhat"], reg_v["yhat"])
         dec = self._auto_decimals(list(self.curve.xs) + list(self.curve.ys))
 
         top = tk.Toplevel(self.root)
-        top.title("逐點比較：原始 / 線性內插 / 線性回歸")
+        top.title("逐點比較：原始 / 內插(演算法) / 內插(均勻) / 線性回歸")
         top.configure(bg=theme.BG)
-        top.geometry("900x600")
+        top.geometry("1040x620")
 
-        win = {"原始": 0, "內插": 0, "回歸": 0}
+        win = {"原始": 0, "內插": 0, "均勻": 0, "回歸": 0}
         for r in rows:
-            win[r["best"]] += 1
+            if r["best"] in win:                     # 排除點 best 為「—」，不計入
+                win[r["best"]] += 1
         summary = (
-            f"原始（校正前）   max {raw_v['max']:.4g}{unit}  RMS {raw_v['rms']:.4g}{unit}  ｜ 最佳 {win['原始']} 點\n"
-            f"線性內插（{lut_v['desc']}）max {lut_v['max']:.4g}{unit}  RMS {lut_v['rms']:.4g}{unit}  ｜ 最佳 {win['內插']} 點\n"
+            f"原始（校正前）     max {raw_v['max']:.4g}{unit}  RMS {raw_v['rms']:.4g}{unit}  ｜ 最佳 {win['原始']} 點\n"
+            f"內插(演算法)（{lut_v['desc']}）max {lut_v['max']:.4g}{unit}  RMS {lut_v['rms']:.4g}{unit}  ｜ 最佳 {win['內插']} 點\n"
+            f"內插(均勻)（{uni_v['desc']}）max {uni_v['max']:.4g}{unit}  RMS {uni_v['rms']:.4g}{unit}  ｜ 最佳 {win['均勻']} 點\n"
             f"線性回歸（{reg_v['desc']}）max {reg_v['max']:.4g}{unit}  RMS {reg_v['rms']:.4g}{unit}  ｜ 最佳 {win['回歸']} 點"
         )
         tk.Label(top, text=summary, bg=theme.BG, fg=theme.TEXT_PRIMARY,
                  font=(theme.MONO, 10), justify="left").pack(anchor="w", padx=10, pady=(8, 4))
 
-        # 可捲動的儲存格表（用 Label grid 才能只給「最佳」欄上色）
+        # 可捲動的儲存格表（用 Label grid 才能只給「最佳」欄上色；欄多故加水平捲軸）
         wrap = tk.Frame(top, bg=theme.BG)
         wrap.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
         cv = tk.Canvas(wrap, bg="#ffffff", highlightthickness=0)
         sb = ttk.Scrollbar(wrap, orient="vertical", command=cv.yview)
+        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=cv.xview)
         grid = tk.Frame(cv, bg="#ffffff")
         cv.create_window((0, 0), window=grid, anchor="nw")
         grid.bind("<Configure>", lambda _e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.configure(yscrollcommand=sb.set)
-        cv.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        cv.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
+        cv.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
 
-        def _wheel(e):
+        def _wheel_v(e):
             cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
-        cv.bind("<MouseWheel>", _wheel)
-        grid.bind("<MouseWheel>", _wheel)
+
+        def _wheel_h(e):                                         # 按住 Shift 橫向捲
+            cv.xview_scroll(-1 if e.delta > 0 else 1, "units")
+        cv.bind("<MouseWheel>", _wheel_v)
+        grid.bind("<MouseWheel>", _wheel_v)
+        cv.bind("<Shift-MouseWheel>", _wheel_h)
+        grid.bind("<Shift-MouseWheel>", _wheel_h)
 
         esuf = "誤差%" if is_rel else "誤差"
         heads = ["#", "原始(MCU)", "目標", f"原始{esuf}",
                  "節點", "內插計算值", f"內插{esuf}",
+                 "均點", "均勻計算值", f"均勻{esuf}",
                  "取樣", "回歸計算值", f"回歸{esuf}", "最佳"]
-        widths = [4, 11, 10, 11, 5, 11, 11, 5, 11, 11, 6]
+        widths = [4, 11, 10, 11, 5, 11, 11, 5, 11, 11, 5, 11, 11, 6]
+
+        # 供「複製到 Excel」用：整表以 Tab 分欄、換行分列（貼進 xlsx 會自動落格）
+        copy_matrix: list[list[str]] = [list(heads)]
+
+        def copy_table() -> None:
+            tsv = "\n".join("\t".join(cells) for cells in copy_matrix)
+            top.clipboard_clear()
+            top.clipboard_append(tsv)
+
+        menu = tk.Menu(top, tearoff=0)
+        menu.add_command(label="複製整個表格（貼到 Excel）", command=copy_table)
+
+        def show_menu(event) -> None:
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
 
         def cell(rr, cc, text, bg="#ffffff", anchor="e", bold=False):
-            tk.Label(grid, text=text, bg=bg, fg=theme.TEXT_PRIMARY,
-                     font=(theme.MONO, 9, "bold" if bold else "normal"),
-                     width=widths[cc], anchor=anchor, padx=3, pady=1,
-                     borderwidth=1, relief="solid").grid(row=rr, column=cc, sticky="nsew")
+            lbl = tk.Label(grid, text=text, bg=bg, fg=theme.TEXT_PRIMARY,
+                           font=(theme.MONO, 9, "bold" if bold else "normal"),
+                           width=widths[cc], anchor=anchor, padx=3, pady=1,
+                           borderwidth=1, relief="solid")
+            lbl.grid(row=rr, column=cc, sticky="nsew")
+            lbl.bind("<Button-3>", show_menu)        # 每格右鍵都能叫出複製選單
+            lbl.bind("<MouseWheel>", _wheel_v)       # 游標在格子上也能滾動
+            lbl.bind("<Shift-MouseWheel>", _wheel_h)
 
         for cc, h in enumerate(heads):
             cell(0, cc, h, bg="#e8edf2", anchor="center", bold=True)
+        cv.bind("<Button-3>", show_menu)
+        grid.bind("<Button-3>", show_menu)
 
         def fv(v):
             return f"{v:.{dec}f}"
@@ -1095,31 +1127,52 @@ class MainWindow:
             return f"{err:+.{dec}f}"
 
         lut_nodes = set(d["lut"]["nodes"]) if d["lut"] else set()
+        uni_nodes = set(d["uniform"]["nodes"]) if d["uniform"] else set()
         reg_fit = set(d.get("reg_fit", []))
+        EXCL_BG = "#f0f0f0"                                      # 排除點（目標值=0）底色
         for i, r in enumerate(rows, start=1):
             idx = r["load"] - 1                                  # 該列對應的樣本索引
+            excl = r.get("excluded", False)
             is_node = idx in lut_nodes
+            is_uni = idx in uni_nodes
             is_fit = idx in reg_fit
-            cell(i, 0, str(r["load"]), anchor="center")
-            cell(i, 1, fv(r["x"]))
-            cell(i, 2, fv(r["y"]))
-            cell(i, 3, fe(r["raw_err"], r["y"]))
-            cell(i, 4, "●" if is_node else "",
-                 bg=self._BEST_BG["內插"] if is_node else "#ffffff", anchor="center")
-            cell(i, 5, fv(r["lut_calc"]))
-            cell(i, 6, fe(r["lut_err"], r["y"]))
-            cell(i, 7, "●" if is_fit else "",
-                 bg=self._BEST_BG["回歸"] if is_fit else "#ffffff", anchor="center")
-            cell(i, 8, fv(r["reg_calc"]))
-            cell(i, 9, fe(r["reg_err"], r["y"]))
-            cell(i, 10, r["best"], bg=self._BEST_BG.get(r["best"], "#ffffff"),
+            raw_e = "—" if excl else fe(r["raw_err"], r["y"])    # 排除點不顯示誤差
+            lut_e = "—" if excl else fe(r["lut_err"], r["y"])
+            uni_e = "—" if excl else fe(r["uni_err"], r["y"])
+            reg_e = "—" if excl else fe(r["reg_err"], r["y"])
+            node_m = "●" if is_node else ""
+            uni_m = "●" if is_uni else ""
+            fit_m = "●" if is_fit else ""
+            ebg = EXCL_BG if excl else "#ffffff"
+            cell(i, 0, str(r["load"]), anchor="center", bg=ebg)
+            cell(i, 1, fv(r["x"]), bg=ebg)
+            cell(i, 2, fv(r["y"]), bg=ebg)
+            cell(i, 3, raw_e, bg=ebg)
+            cell(i, 4, node_m,
+                 bg=self._BEST_BG["內插"] if is_node else ebg, anchor="center")
+            cell(i, 5, fv(r["lut_calc"]), bg=ebg)
+            cell(i, 6, lut_e, bg=ebg)
+            cell(i, 7, uni_m,
+                 bg=self._BEST_BG["均勻"] if is_uni else ebg, anchor="center")
+            cell(i, 8, fv(r["uni_calc"]), bg=ebg)
+            cell(i, 9, uni_e, bg=ebg)
+            cell(i, 10, fit_m,
+                 bg=self._BEST_BG["回歸"] if is_fit else ebg, anchor="center")
+            cell(i, 11, fv(r["reg_calc"]), bg=ebg)
+            cell(i, 12, reg_e, bg=ebg)
+            cell(i, 13, r["best"], bg=self._BEST_BG.get(r["best"], ebg),
                  anchor="center", bold=True)
+            copy_matrix.append([str(r["load"]), fv(r["x"]), fv(r["y"]), raw_e,
+                                node_m, fv(r["lut_calc"]), lut_e,
+                                uni_m, fv(r["uni_calc"]), uni_e,
+                                fit_m, fv(r["reg_calc"]), reg_e, r["best"]])
 
         bar = tk.Frame(top, bg=theme.BG)
         bar.pack(fill="x", padx=10, pady=(0, 8))
-        tk.Label(bar, text="（節點●=內插LUT斷點，取樣●=回歸擬合用點；誤差帶號、相對量度時顯示%；最佳欄：紅=原始 藍=內插 綠=回歸）",
+        tk.Label(bar, text="（節點●=內插斷點，均點●=均勻撒點，取樣●=回歸用點；灰列=目標值0已排除；右鍵可複製整表貼到 Excel）",
                  bg=theme.BG, fg=theme.TEXT_MUTED, font=(theme.UI, 8)).pack(side="left")
         theme.make_button(bar, "匯出 CSV", self._export_comparison_csv).pack(side="right")
+        theme.make_button(bar, "複製到剪貼簿", copy_table).pack(side="right", padx=(0, 6))
         return top
 
     def _export_comparison_csv(self) -> None:
@@ -1132,7 +1185,8 @@ class MainWindow:
         if not path:
             return
         d = self._last
-        rows = engine.export_three_way_csv_rows(self.curve, d["lut"]["yhat"], d["reg"]["yhat"])
+        rows = engine.export_comparison_csv_rows(self.curve, d["lut"]["yhat"],
+                                                 d["uniform"]["yhat"], d["reg"]["yhat"])
         try:
             with open(path, "w", encoding="utf-8-sig", newline="") as f:
                 csv.writer(f).writerows(rows)
