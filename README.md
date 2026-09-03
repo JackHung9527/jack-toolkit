@@ -14,6 +14,7 @@
 | [tools/circuit_calc/](tools/circuit_calc/) | 電路計算機 | 多模式電子電路計算（分壓、單位換算、電流量測放大器…），附參考電路圖、欄位可切單位 | tkinter |
 | [tools/calib_designer/](tools/calib_designer/) | 校正設計工具 | 校正(raw→target)設計/驗證：分段線性查表(LUT) 與 線性回歸並排比較、手動插點、逐點誤差比較，匯出比照韌體的 C 查表/gain-offset | tkinter + matplotlib |
 | [tools/usbhid/](tools/usbhid/) | USB-HID 測試工具 | USB-HID host 終端機：列舉 HID 裝置、開啟指定 VID/PID collection、收 Input report、送 Output report、Get/Set Feature report，HEX/ASCII 雙模式 + log | tkinter + hidapi |
+| [tools/instrument/](tools/instrument/) | 儀器控制台 | 通用儀器控制：USB-TMC / RS232 / LAN / GPIB 四介面統一操作，下 SCPI 等文字命令 Write/Query/Read，傳送結尾(\r\n/\n/\r/無)可設，附掃描儀器、命令歷史與收發 log | tkinter + pyvisa |
 
 ## 目錄結構
 
@@ -77,7 +78,7 @@ jack-toolkit/
 pip install -r requirements.txt
 ```
 
-`tkinter` 是 Python 內建不列入，`netscan` 純標準函式庫也無第三方依賴；`serial` 需要 `pyserial`，`ft232h` 需要 `pyftdi / pyusb / libusb-package`，`usbhid` 需要 `hidapi`。
+`tkinter` 是 Python 內建不列入，`netscan` 純標準函式庫也無第三方依賴；`serial` 需要 `pyserial`，`ft232h` 需要 `pyftdi / pyusb / libusb-package`，`usbhid` 需要 `hidapi`，`instrument` 需要 `pyvisa / pyvisa-py`（USB-TMC 重用 `pyusb/libusb-package`、RS232 重用 `pyserial`；GPIB 另需系統 VISA）。
 
 ## 使用 launcher 啟動
 

@@ -12,6 +12,14 @@ libusb-package>=1.0.26.2
 # USB-HID Tester（Windows wheel 自帶 hidapi.dll，走 OS 內建 HID driver）
 hidapi>=0.14
 
+# 儀器控制台 instrument（PyVISA 統一後端；pyvisa-py 純 Python 後端可重用已裝的
+# pyusb/libusb-package 跑 USB-TMC、pyserial 跑 RS232；GPIB 需另裝系統 VISA）
+pyvisa>=1.13
+pyvisa-py>=0.7
+# 選配：讓「掃描」對 LAN 的 VXI-11/HiSLIP 自動探索生效（不裝也能手動填 IP 連線）
+psutil>=5.9
+zeroconf>=0.70
+
 # 校正設計工具 calib_designer（matplotlib 會一併帶入 numpy）
 matplotlib>=3.5
 

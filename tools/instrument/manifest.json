@@ -1,0 +1,8 @@
+{
+  "name": "instrument",
+  "display_name": "儀器控制台",
+  "description": "通用型儀器控制介面：USB-TMC / RS232 / LAN / GPIB 四種介面統一操作，下 SCPI 等文字命令、Write/Query/Read，傳送結尾 (\\r\\n / \\n / \\r / 無) 可自由設定，附掃描儀器、命令歷史與收發 log",
+  "entry": "main.py",
+  "framework": "tkinter",
+  "requirements": "pyvisa>=1.13, pyvisa-py>=0.7"
+}

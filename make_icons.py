@@ -9,6 +9,7 @@
   commbench 藍綠 / 開發板晶片 + 排針
   circuit_calc 紅 / 電阻（含色環）接線
   usbhid    桃紅 / USB 三叉戟
+  instrument 鋼藍 / 儀器面板 + 量測波形 + 旋鈕
 
 用法：
     python make_icons.py
@@ -164,6 +165,23 @@ def glyph_netpriority() -> list:
     return layers
 
 
+def glyph_instrument() -> list:
+    # 儀器面板意象：上方淺色顯示窗 + 橘色量測波形，下方兩顆旋鈕 + 一顆方形按鈕
+    layers = []
+    layers.append((ik.rrect(0.17, 0.19, 0.83, 0.50, 0.05), (236, 243, 255, 255)))
+    wave = [(0.24, 0.35), (0.30, 0.28), (0.36, 0.35), (0.42, 0.42),
+            (0.48, 0.35), (0.54, 0.28), (0.60, 0.35), (0.66, 0.42),
+            (0.72, 0.35), (0.77, 0.33)]
+    for a, b in zip(wave, wave[1:]):
+        layers.append((ik.segment(a[0], a[1], b[0], b[1], 0.017), ORANGE))
+    layers.append((ik.circle(0.33, 0.68, 0.078), WHITE))
+    layers.append((ik.circle(0.33, 0.68, 0.030), AMBER))
+    layers.append((ik.circle(0.55, 0.68, 0.078), WHITE))
+    layers.append((ik.circle(0.55, 0.68, 0.030), AMBER))
+    layers.append((ik.rrect(0.68, 0.61, 0.83, 0.76, 0.035), AMBER))
+    return layers
+
+
 DESIGNS = {
     "launcher":   {"out": ROOT / "launcher.ico",            "png": None,
                    "bg": ((101, 115, 255), (47, 58, 160)),  "glyph": glyph_launcher},
@@ -183,6 +201,8 @@ DESIGNS = {
                      "bg": ((230, 76, 72), (158, 30, 34)),  "glyph": glyph_circuit_calc},
     "usbhid":     {"out": TOOLS / "usbhid" / "usbhid.ico",  "png": TOOLS / "usbhid" / "icon.png",
                    "bg": ((236, 72, 153), (146, 21, 91)),   "glyph": glyph_usbhid},
+    "instrument": {"out": TOOLS / "instrument" / "instrument.ico", "png": TOOLS / "instrument" / "icon.png",
+                   "bg": ((90, 122, 165), (42, 64, 100)),   "glyph": glyph_instrument},
 }
 
 

@@ -92,6 +92,28 @@ python launcher.py --tool <name>
 
 ## 今日總結
 
+### 2026/09/03
+
+#### 完成項目
+- 在公司機（Windows 帳號 `jackhung.FSP-GROUP`）從零把 jack-toolkit 的執行環境架起來：這個帳號原本**完全沒有 Python**，所有 `.bat` 雙擊都起不來
+- 用 `winget install Python.Python.3.12 --scope user` 裝 Python 3.12.10 到 `%LOCALAPPDATA%\Programs\Python\Python312\`（刻意對齊先前打包 calib_designer 用的版本）
+- 用該 python 跑 `pip install -r requirements.txt`，23 個套件全裝成功：pyserial / pyftdi / pyusb / libusb-package / hidapi / matplotlib 3.11.1，以及儀器控制台需要的 pyvisa 1.16.2 / pyvisa-py 0.8.1 / psutil / zeroconf
+- 四層驗證：11 個模組（含 tkinter 8.6）import OK → `compileall` 掃 tools/ common/ launcher.py 無語法錯誤 → `discover_tools()` 抓到 10 個工具（含新的 instrument）→ 實際 spawn `launcher.py` 與 `tools/instrument/main.py`，兩個視窗（「jack-toolkit launcher」/「儀器控制台」）都正常開出來
+- 在桌面建立 `jack-toolkit.lnk` 捷徑：target 直接寫 pythonw.exe 絕對路徑（不依賴 PATH）、帶 `launcher.ico`、工作目錄設在專案根，實測雙擊可開窗
+- 把 my-claude-extensions 同步安裝到 `~/.claude/`（copy 模式，`install.ps1 -Force`）：2 個 agent + 47 個 skill
+- 提交 2026/07/24 做好但一直沒進版控的 `tools/instrument/`（儀器控制台，1002 行 main.py），連同 README 工具表登錄、`make_icons.py` 的 `glyph_instrument()` 圖示設計、requirements.txt 的 pyvisa 依賴區塊
+
+#### 問題與踩坑
+- **「機器上掃得到 Python」不等於「這個帳號能用」**：這台機器有兩個使用者設定檔 `C:\Users\jackhung`（舊帳號）與 `C:\Users\jackhung.FSP-GROUP`（現用網域帳號）。全機掃 python.exe 只掃到 ESP-IDF 的 venv，其 `pyvenv.cfg` 指向 `C:\Users\jackhung\...\Python312` —— 那份現用帳號讀不到（`Test-Path` 直接 false）。差點誤判成「有裝只是 PATH 沒設」
+- PATH 上的 `python.exe` 是 Microsoft Store 的 App Execution Alias 假捷徑，執行只印「Python was not found; run without arguments to install from the Microsoft Store」，`where python` 找得到但根本不能用 —— 這是 launcher/工具全部「靜默不開」的真正原因
+- winget user-scope 裝完後，使用者層級 PATH 會自動把 `Python312\` 與 `Python312\Scripts\` 插在 `WindowsApps` **前面**（順序正確），但**已經開著的終端機不會更新 PATH**，必須開新視窗才抓得到
+- 專案內既有的 `建立桌面捷徑.bat` 結尾有 `pause`，在非互動環境會卡住；改用它同樣的邏輯（WScript.Shell `CreateShortcut`）直接建 .lnk，結果一致
+- CubeIDE metadata（`.cproject` 的 buildtargets、`.settings/language.settings.xml` 的 `env-hash`、`stm32cubeide.project.prefs` 的 workspace hash）換一台機器開就會變動，屬純雜訊；照 2026/07/08 的做法 `git checkout --` 還原，不進 commit
+
+#### 明日待辦
+- **補寫 2026/07/24 那輪的總結**：`tools/instrument/` 全部檔案的時間戳都是 07/24，代表儀器控制台是那天從零做完的，但 CLAUDE.md 從 07/16 之後就沒有條目 —— 該輪的設計決策與踩坑（VISA backend 選擇、四種介面統一抽象、掃描邏輯）沒有任何紀錄。本次對話拿不到那輪細節，不代寫，需由你補
+- 儀器控制台實機接儀器驗證：目前只確認 UI 開得起來，USB-TMC / RS232 / LAN / GPIB 四條路徑都還沒接真儀器測過
+
 ### 2026/07/16
 
 #### 完成項目
