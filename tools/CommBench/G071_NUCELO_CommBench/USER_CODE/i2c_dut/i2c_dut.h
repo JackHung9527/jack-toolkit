@@ -84,8 +84,35 @@ uint8_t i2c_dut_scan(uint8_t *out_addrs, uint8_t max);
  * 回傳 HAL_I2C_Init 的 status。 */
 HAL_StatusTypeDef i2c_dut_bus_recover(void);
 
-/* 檢查 SCL/SDA 是否都在 high（idle）。回傳 1 = idle，0 = 有 line 被拉 low。 */
+/* 檢查 SCL/SDA 是否都在 high（idle）。回傳 1 = idle，0 = 有 line 被拉 low。
+ *
+ * 注意：線 idle **不代表周邊可用**。傳輸中途把 bus 拔掉時，線會被 pull-up 拉高
+ * （看起來 idle），但 I2C 周邊可能把 ISR.BUSY 留在 set。要判斷能不能發起新交易
+ * 請用 i2c_dut_periph_stuck()。 */
 uint8_t i2c_dut_bus_idle(void);
+
+
+/* ===== 周邊層卡死偵測 / 重置（2026/09/21 新增）=====
+ *
+ * 解的問題：I2C SCAN 一開始正常 → 把 bus 拔掉 → 掃不到 → 插回去仍掃不到 →
+ * 只有 MCU reset 才會好。
+ *
+ * 成因：拔線讓傳輸半途中斷，I2C 周邊把 ISR.BUSY 留在 set（或 hi2c1.State 停在
+ * 非 READY）。HAL_I2C_IsDeviceReady 開頭就是
+ *     if (State == READY) { if (BUSY) return HAL_BUSY; } else return HAL_BUSY;
+ * 直接回傳而且**不清任何旗標**，所以會一直卡著。舊版的 recovery 只看線的電位，
+ * 線插回去後是 high → 判定 idle → 不做事，因此永遠修不好。
+ *
+ * i2c_dut_periph_reset() 用 PE toggle（PE=0 → PE=1）重置 I2C 狀態機，這是不重新
+ * Init 就能清掉 ISR.BUSY 的唯一方法；只要幾十奈秒，可放心在每次交易前檢查。 */
+
+/* 周邊是否處於無法發起新交易的狀態。1 = 卡住，0 = 可用。 */
+uint8_t i2c_dut_periph_stuck(void);
+
+/* PE toggle 重置 I2C 狀態機 + 清錯誤旗標 + 把 HAL 狀態 / Lock 拉回 READY。
+ * 回傳 HAL_OK = 重置後已可用；HAL_ERROR = 仍然卡住（多半是線被拉住，
+ * 這時要改用 i2c_dut_bus_recover() 做 bit-bang unstuck）。 */
+HAL_StatusTypeDef i2c_dut_periph_reset(void);
 
 
 #endif /* I2C_DUT_H_ */

@@ -18,6 +18,10 @@ extern I2C_HandleTypeDef hi2c1;
 #define I2C_RECOVER_HALF_PERIOD_MS   1U
 #define I2C_RECOVER_MAX_CLOCKS       9U
 
+/* PE=0 之後要維持至少 3 個 APB clock 才會真的重置狀態機（RM0444 §31.4.2 "PE"）。
+ * 64 MHz 下 3 cycles < 50 ns，給 16 次空迴圈是明顯足夠的保險值。 */
+#define I2C_PE_TOGGLE_CYCLES         16U
+
 
 /* ---------------- forward decls ---------------- */
 
@@ -123,11 +127,21 @@ HAL_StatusTypeDef i2c_dut_write_reg(uint8_t addr7, uint8_t reg,
 
 HAL_StatusTypeDef i2c_dut_is_device_ready(uint8_t addr7)
 {
-    /* 不做 auto-recover：scan 期間 NACK 是正常結果，bus 仍 idle，
-     * recover 反而會拖慢 scan ~ N * 15 ms。
-     */
-    return HAL_I2C_IsDeviceReady(&hi2c1, I2C_ADDR_SHIFT(addr7),
-                                 1, I2C_DUT_TIMEOUT_MS);
+    HAL_StatusTypeDef st;
+
+    /* 先確保周邊不是卡死狀態（見 i2c_dut_periph_stuck 的說明）。
+     * 這一步很便宜（沒卡住時只是讀兩個暫存器），不會拖慢 scan。 */
+    if (i2c_dut_periph_stuck())
+    {
+        (void)i2c_dut_periph_reset();
+    }
+
+    st = HAL_I2C_IsDeviceReady(&hi2c1, I2C_ADDR_SHIFT(addr7),
+                               1, I2C_DUT_TIMEOUT_MS);
+
+    /* 單純 NACK（bus 仍 idle、周邊也正常）不做 recover —— 那是 scan 的正常結果，
+     * 每個 NACK 都跑 bit-bang recovery 會讓整輪 scan 多花 N * 15 ms。 */
+    return _recover_if_stuck(st);
 }
 
 
@@ -140,19 +154,102 @@ HAL_StatusTypeDef i2c_dut_is_device_ready(uint8_t addr7)
 uint8_t i2c_dut_scan(uint8_t *out_addrs, uint8_t max)
 {
     uint8_t found = 0;
+
+    /* 開掃前先清掉上一輪留下的卡死狀態。
+     *
+     * 為什麼非做不可：把 bus 拔掉時，傳輸會在半途中斷，I2C 周邊可能把 ISR.BUSY
+     * 留在 set，或讓 hi2c1.State 停在非 READY。HAL_I2C_IsDeviceReady 開頭就是
+     *     if (State == READY) { if (BUSY) return HAL_BUSY; } else return HAL_BUSY;
+     * ——**直接回傳且不清任何東西**。所以線插回去之後每次掃描仍然全部失敗，
+     * 只有 MCU reset 才會好。這正是 2026/09/21 回報的症狀。 */
+    if (i2c_dut_periph_stuck())
+    {
+        (void)i2c_dut_periph_reset();
+    }
+
     for (uint8_t addr = 0x08U; addr <= 0x77U; addr++)
     {
-        if (HAL_I2C_IsDeviceReady(&hi2c1, I2C_ADDR_SHIFT(addr),
-                                  1, I2C_DUT_TIMEOUT_MS) == HAL_OK)
+        HAL_StatusTypeDef st = HAL_I2C_IsDeviceReady(&hi2c1, I2C_ADDR_SHIFT(addr),
+                                                     1, I2C_DUT_TIMEOUT_MS);
+        if (st == HAL_OK)
         {
             if ((out_addrs != NULL) && (found < max))
             {
                 out_addrs[found] = addr;
             }
             found++;
+            continue;
+        }
+
+        /* HAL_BUSY = 周邊卡住（不是 NACK，NACK 回的是 HAL_ERROR/HAL_TIMEOUT）。
+         * 不處理的話剩下的位址會全部空轉，整輪 scan 變成無意義。 */
+        if (st == HAL_BUSY)
+        {
+            (void)i2c_dut_periph_reset();
+            /* 線真的被拉住（例如 slave 卡在 ACK）才做慢速 bit-bang unstuck */
+            if (!i2c_dut_bus_idle())
+            {
+                (void)i2c_dut_bus_recover();
+            }
         }
     }
     return found;
+}
+
+
+/* ===========================================================================
+ *  周邊層卡死偵測與重置
+ *
+ *  與 i2c_dut_bus_recover() 的分工：
+ *    - i2c_dut_bus_recover()  處理「線被拉住」——SDA 被 slave 卡在 low，
+ *      要靠 bit-bang 送 clock 把它推完。慢（~20 ms），且要重新 Init。
+ *    - i2c_dut_periph_reset() 處理「線是好的，但周邊自己卡住」——最典型的就是
+ *      傳輸中途把 bus 拔掉，ISR.BUSY 留在 set。這時 bus_idle() 會回 true
+ *      （線插回去後被 pull-up 拉高），舊版因此判定「不用 recover」而永遠修不好。
+ *      PE toggle 只要幾十奈秒，可以放心在每次交易前檢查。
+ * ========================================================================= */
+uint8_t i2c_dut_periph_stuck(void)
+{
+    if (hi2c1.State != HAL_I2C_STATE_READY)
+    {
+        return 1U;
+    }
+    if (__HAL_I2C_GET_FLAG(&hi2c1, I2C_FLAG_BUSY) != RESET)
+    {
+        return 1U;
+    }
+    return 0U;
+}
+
+
+HAL_StatusTypeDef i2c_dut_periph_reset(void)
+{
+    volatile uint32_t i;
+
+    /* 1. 清掉會黏住的錯誤旗標（拔線多半是 BERR / ARLO） */
+    __HAL_I2C_CLEAR_FLAG(&hi2c1, I2C_FLAG_BERR | I2C_FLAG_ARLO | I2C_FLAG_OVR);
+
+    /* 2. PE toggle：PE=0 會把 I2C 狀態機連同 ISR.BUSY 一起重置，這是唯一能在
+     *    不重新 Init 的情況下清掉 BUSY 的方法。 */
+    __HAL_I2C_DISABLE(&hi2c1);
+    for (i = 0U; i < I2C_PE_TOGGLE_CYCLES; i++)
+    {
+        __NOP();
+    }
+    __HAL_I2C_ENABLE(&hi2c1);
+
+    /* 3. 把 HAL 這一層的狀態也拉回 READY。
+     *    Lock 一定要解 —— 若前一次呼叫是在 __HAL_LOCK 之後才失敗的，Lock 會留在
+     *    LOCKED，之後每個 API 開頭的 __HAL_LOCK 都直接回 HAL_BUSY。 */
+    hi2c1.ErrorCode    = HAL_I2C_ERROR_NONE;
+    hi2c1.State        = HAL_I2C_STATE_READY;
+    /* I2C_STATE_NONE 是 HAL .c 裡的私有巨集（外部取不到），其定義就是
+     * ((uint32_t)HAL_I2C_MODE_NONE)，直接用公開的那個列舉值等價。 */
+    hi2c1.PreviousState = (uint32_t)HAL_I2C_MODE_NONE;
+    hi2c1.Mode         = HAL_I2C_MODE_NONE;
+    __HAL_UNLOCK(&hi2c1);
+
+    return i2c_dut_periph_stuck() ? HAL_ERROR : HAL_OK;
 }
 
 
@@ -240,10 +337,22 @@ static HAL_StatusTypeDef _recover_if_stuck(HAL_StatusTypeDef st)
     {
         return st;
     }
-    if (i2c_dut_bus_idle())
+
+    /* 線被拉住 → 慢速 bit-bang unstuck（會重新 Init，順便清掉周邊狀態） */
+    if (!i2c_dut_bus_idle())
     {
+        (void)i2c_dut_bus_recover();
         return st;
     }
-    (void)i2c_dut_bus_recover();
+
+    /* 線是好的但周邊卡住 → 只要 PE toggle 就夠，幾十奈秒。
+     *
+     * 舊版到「bus idle」就 return 了，於是「傳輸中途拔線」這個情境永遠修不好：
+     * 線插回去後 pull-up 把兩條線拉高 → bus_idle() = true → 判定不用 recover，
+     * 但 ISR.BUSY 還卡著，之後每次交易都回 HAL_BUSY，只能靠 MCU reset。 */
+    if (i2c_dut_periph_stuck())
+    {
+        (void)i2c_dut_periph_reset();
+    }
     return st;
 }
