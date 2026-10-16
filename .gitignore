@@ -51,3 +51,6 @@ tools/ft232h/tools/_cache/
 *.lst
 *.list
 launcher_error.log
+
+# CubeIDE 自動回寫的程式碼提示快取：每次開 IDE 都會重算 env-hash 並改寫，和編譯無關（2026-10-16 起不進 git）
+**/.settings/language.settings.xml
